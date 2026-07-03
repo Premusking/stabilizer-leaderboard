@@ -400,20 +400,21 @@ function ActivityTracker({ isMobile, jumpToWallet }) {
   }, [searchedWallet]);
 
   const rangeMs  = range==="daily"?7*86400000:range==="weekly"?28*86400000:180*86400000;
-  const filtered = useMemo(()=>{
-    const now = Date.now();
-    return events.filter(e => {
-      const inRange = (now - e.timeStamp*1000) <= rangeMs;
-      const typeMatch = typeFilter === "all" || classifyTx(e) === typeFilter;
-      return inRange && typeMatch;
-    });
-  },[events, rangeMs, typeFilter]);
+  const filtered = useMemo(()=>
+    typeFilter === "all" ? events : events.filter(e => classifyTx(e) === typeFilter),
+    [events, typeFilter]
+  );
+
+  const recentForChart = useMemo(()=>
+    events.filter(e => (Date.now() - e.timeStamp*1000) <= rangeMs),
+    [events, rangeMs]
+  );
 
   const summary = useMemo(()=>{
     const s = {swap:0,deposit:0,withdraw:0,transfer:0};
-    events.filter(e=>(Date.now()-e.timeStamp*1000)<=rangeMs).forEach(e=>{s[classifyTx(e)]=(s[classifyTx(e)]||0)+1;});
+    recentForChart.forEach(e=>{s[classifyTx(e)]=(s[classifyTx(e)]||0)+1;});
     return s;
-  },[events, rangeMs]);
+  },[recentForChart]);
 
   // Pool breakdown
   const poolBreakdown = useMemo(()=>{
@@ -533,7 +534,7 @@ function ActivityTracker({ isMobile, jumpToWallet }) {
               ))}
             </div>
           </div>
-          <ActivityChart events={events} range={range} isMobile={isMobile} />
+          <ActivityChart events={recentForChart} range={range} isMobile={isMobile} />
         </div>
 
         {/* Activity type pills */}
