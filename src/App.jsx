@@ -31,6 +31,7 @@ const ACTIVITY_TYPES = {
   swap:     { label: "Swap",               color: "#f59e0b", icon: "⇄" },
   deposit:  { label: "Liquidity Added",    color: "#00d4aa", icon: "+"  },
   withdraw: { label: "Liquidity Removed",  color: "#ef4444", icon: "−"  },
+  claim:    { label: "Fees Claimed",       color: "#8b5cf6", icon: "★"  },
   transfer: { label: "Transfer",           color: "#94a3b8", icon: "→"  },
 };
 
@@ -139,12 +140,21 @@ async function fetchWalletTxs(walletAddress) {
 
 function classifyTx(tx) {
   const input = tx.input?.toLowerCase() || "";
-  // Common function selectors
-  if (input.startsWith("0x38ed1739") || input.startsWith("0x7ff36ab5") || input.startsWith("0x18cbafe5") || input.startsWith("0xd0e30db0")) return "swap";
-  if (input.startsWith("0xe8eda9df") || input.startsWith("0xb6b55f25") || input.startsWith("0x47e7ef24") || input.startsWith("0xf340fa01")) return "deposit";
+  const method = tx.methodId?.toLowerCase() || input.slice(0, 10);
+
+  // Stabilizer specific selectors (from real tx data)
+  if (method === "0xfe029156") return "swap";           // swap(address,address,uint256,uint256)
+  if (method === "0x68ffa1a8") return "deposit";        // addLiquidity / 0x68ffa1a8
+  if (method === "0x6bf08450") return "deposit";        // addLiquidity variant
+  if (method === "0x46f66e42" || input.startsWith("0x46f66e42")) return "withdraw"; // removeLiquidity
+  if (method === "0x349d8b48" || input.startsWith("0x349d8b48")) return "claim";    // claimFees
+
+  // Generic selectors fallback
+  if (input.startsWith("0x38ed1739") || input.startsWith("0x7ff36ab5") || input.startsWith("0x18cbafe5")) return "swap";
+  if (input.startsWith("0xe8eda9df") || input.startsWith("0xb6b55f25") || input.startsWith("0x47e7ef24")) return "deposit";
   if (input.startsWith("0x69328dec") || input.startsWith("0x2e1a7d4d") || input.startsWith("0x441a3e70")) return "withdraw";
   if (input === "0x" || input === "") return "transfer";
-  return "deposit"; // default to deposit for unknown contract interactions
+  return "deposit";
 }
 
 // ─────────────────────────────────────────────
