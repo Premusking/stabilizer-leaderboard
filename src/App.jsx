@@ -106,21 +106,17 @@ async function fetchTokenTransfers(contractAddress) {
 async function fetchWalletTxs(walletAddress) {
   const results = [];
   const wallet = walletAddress.toLowerCase();
-  const poolAddrs = Object.values(POOLS).map(p => p.address.toLowerCase());
 
-  // Search by wallet address directly — much more efficient
-  // Etherscan returns all txs for this wallet, we filter for Stabilizer contracts
-  const url = `/api/etherscan?address=${walletAddress}&action=txlist&offset=10000`;
+  // Fetch wallet's own tx history — fast single call
+  const url = `/api/etherscan?address=${walletAddress}&action=txlist&offset=5000&page=1`;
   try {
     const res  = await fetch(url);
     const data = await res.json();
-    if (data.status === "1" && data.result.length > 0) {
+    if (data.status === "1") {
       data.result.forEach(tx => {
-        const toAddr   = tx.to?.toLowerCase();
-        const fromAddr = tx.from?.toLowerCase();
+        const toAddr = tx.to?.toLowerCase();
         const matchedPool = Object.entries(POOLS).find(([k, v]) =>
-          v.address.toLowerCase() === toAddr ||
-          v.address.toLowerCase() === fromAddr
+          v.address.toLowerCase() === toAddr
         );
         if (matchedPool) {
           results.push({
@@ -163,12 +159,15 @@ function classifyTx(tx) {
 async function buildLeaderboard() {
   const allTxs = [];
   for (const [poolKey, poolInfo] of Object.entries(POOLS)) {
-    const url = `/api/etherscan?address=${poolInfo.address}&action=txlist`;
+    // Only fetch latest 1000 txs per pool to stay within timeout
+    const url = `/api/etherscan?address=${poolInfo.address}&action=txlist&offset=1000&page=1`;
     try {
       const res  = await fetch(url);
       const data = await res.json();
       if (data.status === "1") {
-        data.result.forEach(tx => allTxs.push({ ...tx, poolKey, poolLabel: poolInfo.label, poolColor: poolInfo.color }));
+        data.result.forEach(tx => allTxs.push({
+          ...tx, poolKey, poolLabel: poolInfo.label, poolColor: poolInfo.color
+        }));
       }
     } catch {}
   }
