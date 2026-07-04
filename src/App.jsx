@@ -1,6 +1,9 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 
 // ── CONTRACTS ──────────────────────────────────────────────
+// The Router is the main contract users interact with for swaps
+const ROUTER_ADDR = "0xFa6419a3d3503a016dF3A59F690734862CA2A78D".toLowerCase();
+
 const POOLS = {
   tPool: { label: "T-Pool", color: "#26A17B", token: "USDT", address: "0x7C348b70F640B47b64ecDb154960D337ce7a98B4" },
   cPool: { label: "C-Pool", color: "#2775CA", token: "USDC", address: "0x0578E5EA652C62DB20F4475F685A4b587314A30f" },
@@ -9,6 +12,9 @@ const POOLS = {
 };
 const POOL_ADDRS = new Set(Object.values(POOLS).map(p => p.address.toLowerCase()));
 const POOL_BY_ADDR = Object.fromEntries(Object.entries(POOLS).map(([k,v]) => [v.address.toLowerCase(), {key:k,...v}]));
+
+// All Stabilizer contracts (router + pools)
+const ALL_STABILIZER_ADDRS = new Set([ROUTER_ADDR, ...Object.values(POOLS).map(p => p.address.toLowerCase())]);
 
 // SP: 1 per $1000 volume
 function calcSP(vol) { return Math.floor(vol / 1000); }
@@ -22,21 +28,20 @@ const TIERS = [
 ];
 function getTier(sp) { return TIERS.find(t => sp >= t.minSP) || TIERS[TIERS.length-1]; }
 
-// Classify tx by method selector
-const METHOD_TYPE = {
-  "0xfe029156": "swap",
-  "0x6bf08450": "swap",
-  "0x68ffa1a8": "deposit",
-  "0x46f66e42": "deposit",
-  "0xe8eda9df": "deposit",
-  "0xb6b55f25": "deposit",
-  "0x349d8b48": "claim",
-  "0x0a7c4960": "claim",
-  "0x9163cd89": "claim",
-};
+// Classify tx - swap goes to router, claim/deposit go to pool
 function getTxType(tx) {
+  const to  = tx.to?.toLowerCase() || "";
   const mid = (tx.methodId || tx.input?.slice(0,10) || "").toLowerCase();
-  return METHOD_TYPE[mid] || "other";
+
+  if (to === ROUTER_ADDR) return "swap";
+
+  const claimMethods = new Set(["0x349d8b48","0x0a7c4960","0x9163cd89","0x82013098","0xb78f8012","0x0a7c4960"]);
+  if (claimMethods.has(mid)) return "claim";
+
+  const depositMethods = new Set(["0x68ffa1a8","0x46f66e42","0xe8eda9df","0xb6b55f25","0x6bf08450"]);
+  if (depositMethods.has(mid) && POOL_ADDRS.has(to)) return "deposit";
+
+  return null;
 }
 
 // ── HELPERS ────────────────────────────────────────────────
@@ -50,6 +55,7 @@ function timeAgo(ts) {
 }
 function fmtUSD(n) {
   if (!n) return "$0";
+  if (n >= 1_000_000_000) return `$${(n/1_000_000_000).toFixed(2)}B`;
   if (n >= 1_000_000) return `$${(n/1_000_000).toFixed(2)}M`;
   if (n >= 1_000)     return `$${(n/1_000).toFixed(1)}K`;
   return `$${Math.floor(n)}`;
@@ -63,126 +69,98 @@ function useIsMobile() {
   return m;
 }
 
-// ── API — fetch ALL pages of wallet txs ───────────────────
-async function fetchAllWalletTxs(wallet) {
+// ── API ────────────────────────────────────────────────────
+async function apiGet(address, action, offset=10000, page=1) {
+  try {
+    const r = await fetch(`/api/etherscan?address=${address}&action=${action}&offset=${offset}&page=${page}`);
+    const d = await r.json();
+    return d.status==="1" ? d.result : [];
+  } catch { return []; }
+}
+
+// Fetch ALL pages of txs for a wallet
+async function fetchAllTxs(wallet) {
   const all = [];
-  let page = 1;
-  const offset = 10000;
-  while (true) {
-    try {
-      const r = await fetch(`/api/etherscan?address=${wallet}&action=txlist&offset=${offset}&page=${page}`);
-      const d = await r.json();
-      if (d.status !== "1" || !d.result?.length) break;
-      all.push(...d.result);
-      if (d.result.length < offset) break; // last page
-      page++;
-      if (page > 10) break; // safety cap at 100k txs
-    } catch { break; }
+  for (let page=1; page<=20; page++) {
+    const txs = await apiGet(wallet, "txlist", 10000, page);
+    if (!txs.length) break;
+    all.push(...txs);
+    if (txs.length < 10000) break;
   }
   return all;
 }
 
-// Also fetch internal txs (some stabilizer txs show as internal)
-async function fetchInternalTxs(wallet) {
-  try {
-    const r = await fetch(`/api/etherscan?address=${wallet}&action=txlistinternal&offset=10000&page=1`);
-    const d = await r.json();
-    return d.status === "1" ? d.result : [];
-  } catch { return []; }
+// Fetch ALL token transfers for volume calculation
+async function fetchAllTokenTxs(wallet) {
+  const all = [];
+  for (let page=1; page<=5; page++) {
+    const txs = await apiGet(wallet, "tokentx", 10000, page);
+    if (!txs.length) break;
+    all.push(...txs);
+    if (txs.length < 10000) break;
+  }
+  return all;
 }
 
-async function fetchWalletActivity(walletAddr) {
-  const [txs, internal] = await Promise.all([
-    fetchAllWalletTxs(walletAddr),
-    fetchInternalTxs(walletAddr),
-  ]);
-
-  const wallet = walletAddr.toLowerCase();
-  const results = [];
-  const seen = new Set();
-
-  // Process normal txs
-  txs.forEach(tx => {
-    if (tx.isError === "1") return;
-    const to   = tx.to?.toLowerCase();
-    const from = tx.from?.toLowerCase();
-
-    // Include if tx is TO a pool contract (user action)
-    const pool = POOL_BY_ADDR[to];
-    if (!pool) return;
-    if (seen.has(tx.hash)) return;
-    seen.add(tx.hash);
-
-    const type = getTxType(tx);
-    if (type === "other") return;
-
-    // Extract value — use tx value field (ETH) or parse from input
-    // For stablecoin pools, value comes from token transfer
-    // We'll get the volume from token transfers separately
-    results.push({
-      ...tx,
-      poolKey: pool.key,
-      poolLabel: pool.label,
-      poolColor: pool.color,
-      txType: type,
-      volumeUSD: 0, // will be enriched below
-    });
-  });
-
-  return results.sort((a,b) => parseInt(b.timeStamp) - parseInt(a.timeStamp));
-}
-
-// Fetch ERC20 token transfers for a wallet to get actual amounts
-async function fetchTokenTransfers(wallet) {
-  try {
-    const r = await fetch(`/api/etherscan?address=${wallet}&action=tokentx&offset=10000&page=1`);
-    const d = await r.json();
-    return d.status === "1" ? d.result : [];
-  } catch { return []; }
-}
-
-// Main function: get wallet activity with real USD volumes
-async function getWalletData(walletAddr) {
-  const [txs, tokenTxs] = await Promise.all([
-    fetchAllWalletTxs(walletAddr),
-    fetchTokenTransfers(walletAddr),
-  ]);
-
-  const wallet = walletAddr.toLowerCase();
-
-  // Build token transfer map by tx hash for volume lookup
-  const volByHash = {};
+// Get volume per tx hash from token transfers
+// For swaps: user sends stablecoin TO router — use that as volume
+function buildVolMap(tokenTxs, wallet) {
+  const volMap = {};
+  const w = wallet.toLowerCase();
   tokenTxs.forEach(t => {
-    const pool = POOL_BY_ADDR[t.to?.toLowerCase()] || POOL_BY_ADDR[t.from?.toLowerCase()];
-    if (!pool) return;
-    const decimals = t.tokenDecimal ? parseInt(t.tokenDecimal) : 6;
-    const amount = Number(BigInt(t.value) / BigInt(10**Math.min(decimals,18))) ;
-    const usd = Math.min(amount, 50_000_000); // sanity cap
-    if (!volByHash[t.hash]) volByHash[t.hash] = 0;
-    volByHash[t.hash] += usd;
+    const from = t.from?.toLowerCase();
+    const to   = t.to?.toLowerCase();
+    // Count token sent FROM wallet to router/pool as the swap volume
+    if (from === w && ALL_STABILIZER_ADDRS.has(to)) {
+      const dec = parseInt(t.tokenDecimal) || 6;
+      // Use string math to avoid float precision issues
+      const raw = t.value || "0";
+      const divisor = Math.pow(10, dec);
+      const amount = parseFloat(raw) / divisor;
+      if (!volMap[t.hash]) volMap[t.hash] = 0;
+      volMap[t.hash] += Math.min(amount, 1_000_000_000);
+    }
   });
+  return volMap;
+}
 
+async function getWalletData(walletAddr) {
+  const [allTxs, tokenTxs] = await Promise.all([
+    fetchAllTxs(walletAddr),
+    fetchAllTokenTxs(walletAddr),
+  ]);
+
+  const volMap = buildVolMap(tokenTxs, walletAddr);
   const results = [];
   const seen = new Set();
 
-  txs.forEach(tx => {
+  allTxs.forEach(tx => {
     if (tx.isError === "1") return;
-    const to = tx.to?.toLowerCase();
-    const pool = POOL_BY_ADDR[to];
-    if (!pool) return;
+    const type = getTxType(tx);
+    if (!type) return;
     if (seen.has(tx.hash)) return;
     seen.add(tx.hash);
 
-    const type = getTxType(tx);
-    if (type === "other") return;
+    // For swaps: get volume from token transfer map
+    // For claims: volume = 0 (claiming fees, not swapping)
+    const volumeUSD = type === "swap" ? (volMap[tx.hash] || 0) : 0;
 
-    const volumeUSD = volByHash[tx.hash] || 0;
+    // Determine which pool (for swaps, check token transfers)
+    let poolKey = "tPool"; // default
+    const relatedTokenTx = tokenTxs.find(t =>
+      t.hash === tx.hash &&
+      POOL_BY_ADDR[t.to?.toLowerCase()]
+    );
+    if (relatedTokenTx) {
+      const p = POOL_BY_ADDR[relatedTokenTx.to?.toLowerCase()];
+      if (p) poolKey = p.key;
+    }
 
     results.push({
       ...tx,
-      poolKey: pool.key,
-      poolLabel: pool.label,
-      poolColor: pool.color,
+      poolKey,
+      poolLabel: POOLS[poolKey].label,
+      poolColor: POOLS[poolKey].color,
       txType: type,
       volumeUSD,
     });
@@ -191,32 +169,90 @@ async function getWalletData(walletAddr) {
   return results.sort((a,b) => parseInt(b.timeStamp) - parseInt(a.timeStamp));
 }
 
+// Leaderboard: fetch router txs to get all swappers
+async function buildLeaderboard() {
+  const wallets = {};
+
+  // Fetch latest txs from router (main swap contract)
+  const routerTxs = await apiGet(ROUTER_ADDR, "txlist", 2000, 1);
+  // Also fetch from pool contracts for deposits/claims
+  const poolTxsArr = await Promise.all(
+    Object.values(POOLS).map(p => apiGet(p.address, "txlist", 500, 1))
+  );
+  const allPoolTxs = poolTxsArr.flat();
+
+  // Process router txs (swaps)
+  routerTxs.forEach(tx => {
+    if (tx.isError === "1") return;
+    const addr = tx.from?.toLowerCase();
+    if (!addr) return;
+    if (!wallets[addr]) wallets[addr] = { address: tx.from, swaps:0, claims:0, swapVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
+    wallets[addr].swaps++;
+    const ts = parseInt(tx.timeStamp);
+    if (ts > wallets[addr].lastSeen)  wallets[addr].lastSeen  = ts;
+    if (ts < wallets[addr].firstSeen) wallets[addr].firstSeen = ts;
+  });
+
+  // Process pool txs (claims)
+  allPoolTxs.forEach(tx => {
+    if (tx.isError === "1") return;
+    const mid = (tx.methodId || "").toLowerCase();
+    const claimMethods = new Set(["0x349d8b48","0x0a7c4960","0x9163cd89"]);
+    if (!claimMethods.has(mid)) return;
+    const addr = tx.from?.toLowerCase();
+    if (!addr) return;
+    if (!wallets[addr]) wallets[addr] = { address: tx.from, swaps:0, claims:0, swapVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
+    wallets[addr].claims++;
+    const ts = parseInt(tx.timeStamp);
+    if (ts > wallets[addr].lastSeen) wallets[addr].lastSeen = ts;
+    if (ts < wallets[addr].firstSeen) wallets[addr].firstSeen = ts;
+  });
+
+  // Get token transfers for router to calculate volumes
+  const routerTokenTxs = await apiGet(ROUTER_ADDR, "tokentx", 5000, 1);
+  routerTokenTxs.forEach(t => {
+    const from = t.from?.toLowerCase();
+    const to   = t.to?.toLowerCase();
+    if (to !== ROUTER_ADDR) return;
+    if (!wallets[from]) return;
+    const dec = parseInt(t.tokenDecimal) || 6;
+    const amount = parseFloat(t.value) / Math.pow(10, dec);
+    wallets[from].swapVolumeUSD += Math.min(amount, 1_000_000_000);
+  });
+
+  return Object.values(wallets)
+    .map(w => ({
+      ...w,
+      sp: calcSP(w.swapVolumeUSD),
+      daysActive: w.firstSeen < Infinity ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - w.firstSeen) / 86400)) : 1,
+    }))
+    .sort((a,b) => b.sp - a.sp || b.swapVolumeUSD - a.swapVolumeUSD)
+    .slice(0, 10000);
+}
+
 // ── UI COMPONENTS ──────────────────────────────────────────
 function Spinner({ text }) {
   return (
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"60px 20px",gap:14}}>
       <div style={{width:42,height:42,borderRadius:"50%",border:"3px solid #1e293b",borderTopColor:"#00d4aa",animation:"spin 0.8s linear infinite"}}/>
-      <div style={{fontSize:13,color:"#4a5568"}}>{text}</div>
+      <div style={{fontSize:13,color:"#4a5568",textAlign:"center"}}>{text}</div>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   );
 }
-
 function TierBadge({ sp }) {
   const t = getTier(sp);
   return <span style={{fontSize:11,background:`${t.color}18`,border:`1px solid ${t.color}44`,color:t.color,borderRadius:6,padding:"2px 8px",fontWeight:700,whiteSpace:"nowrap"}}>{t.icon} {t.name}</span>;
 }
-
-function StatBox({ label, value, color, sub, big }) {
+function StatBox({ label, value, color, sub }) {
   return (
     <div style={{background:"#0a0f1e",border:`1px solid ${color}33`,borderRadius:12,padding:"14px 16px"}}>
       <div style={{fontSize:10,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}}>{label}</div>
-      <div style={{fontSize:big?28:20,fontWeight:800,color,fontFamily:"'Space Grotesk',monospace",letterSpacing:"-0.02em"}}>{value}</div>
+      <div style={{fontSize:20,fontWeight:800,color,fontFamily:"'Space Grotesk',monospace",letterSpacing:"-0.02em"}}>{value}</div>
       {sub&&<div style={{fontSize:11,color:"#4a5568",marginTop:3}}>{sub}</div>}
     </div>
   );
 }
-
 function ActivityChart({ events, range, isMobile }) {
   const buckets = useMemo(()=>{
     const now = Math.floor(Date.now()/1000);
@@ -231,22 +267,19 @@ function ActivityChart({ events, range, isMobile }) {
     });
     return arr;
   },[events,range]);
-
   const maxVol = Math.max(...buckets.map(b=>b.volume),1);
-  const maxCount = Math.max(...buckets.map(b=>b.count),1);
-
   return (
-    <div style={{display:"flex",alignItems:"flex-end",gap:isMobile?6:12,height:130,padding:"0 4px"}}>
+    <div style={{display:"flex",alignItems:"flex-end",gap:isMobile?6:12,height:130,padding:"4px 4px 0"}}>
       {buckets.map((b,i)=>(
         <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
-          {b.volume>0&&<div style={{fontSize:9,color:"#4a5568",textAlign:"center",lineHeight:1.2}}>{fmtUSD(b.volume)}</div>}
+          {b.volume>0&&<div style={{fontSize:9,color:"#4a5568",textAlign:"center"}}>{fmtUSD(b.volume)}</div>}
           <div style={{
-            width:"100%",maxWidth:36,
+            width:"100%",maxWidth:40,
             height:`${Math.max((b.volume/maxVol)*90,b.volume>0?8:2)}px`,
             background:b.volume>0?"linear-gradient(180deg,#00d4aa,#0088ff)":"#1e293b",
             borderRadius:4,transition:"height 0.4s",position:"relative"
           }}>
-            {b.count>0&&<div style={{position:"absolute",top:-18,left:"50%",transform:"translateX(-50%)",fontSize:9,color:"#00d4aa",whiteSpace:"nowrap"}}>{b.count}tx</div>}
+            {b.count>0&&<div style={{position:"absolute",top:-16,left:"50%",transform:"translateX(-50%)",fontSize:9,color:"#00d4aa",whiteSpace:"nowrap"}}>{b.count}tx</div>}
           </div>
           <div style={{fontSize:10,color:"#718096"}}>{b.label}</div>
         </div>
@@ -255,11 +288,64 @@ function ActivityChart({ events, range, isMobile }) {
   );
 }
 
-// ── MAIN APP ───────────────────────────────────────────────
-export default function App() {
-  const isMobile = useIsMobile();
+// ── LEADERBOARD ROW ────────────────────────────────────────
+function LeaderRow({ lp, rank, isMobile, expanded, onToggle, onView }) {
+  const tier = getTier(lp.sp);
+  const ac = ["#00d4aa","#0088ff","#8b5cf6","#f59e0b","#ef4444","#22c55e","#ec4899"];
+  return (
+    <div style={{background:rank<=3?`linear-gradient(135deg,${tier.color}08,#0d1525)`:"#0d1525",border:`1px solid ${rank<=3?tier.color+"44":"#1e293b"}`,borderRadius:12,padding:isMobile?"12px":"14px 18px",cursor:"pointer",marginBottom:8}}>
+      <div onClick={onToggle} style={{display:"flex",alignItems:"center",gap:isMobile?8:14}}>
+        <div style={{minWidth:32,textAlign:"center"}}>
+          {rank<=3?<span style={{fontSize:20}}>{"🥇🥈🥉"[rank-1]}</span>:<span style={{fontSize:13,fontWeight:800,color:"#4a5568",fontFamily:"monospace"}}>#{rank}</span>}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,flex:1,minWidth:0}}>
+          <div style={{width:isMobile?28:36,height:isMobile?28:36,borderRadius:"50%",flexShrink:0,background:`linear-gradient(135deg,${ac[rank%7]},#1e293b)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:800,color:"#060b18"}}>{lp.address[2]?.toUpperCase()}</div>
+          <div style={{minWidth:0,flex:1}}>
+            <div style={{fontSize:12,fontWeight:700,color:"#e2e8f0",fontFamily:"'Space Grotesk',monospace",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{shortAddr(lp.address)}</div>
+            <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2}}><TierBadge sp={lp.sp}/></div>
+          </div>
+        </div>
+        {!isMobile&&<>
+          <div style={{textAlign:"right",minWidth:90}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>⭐ SP</div><div style={{fontSize:15,fontWeight:800,color:"#f59e0b",fontFamily:"'Space Grotesk',monospace"}}>{lp.sp.toLocaleString()}</div></div>
+          <div style={{textAlign:"right",minWidth:100}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>💰 Swap Vol</div><div style={{fontSize:15,fontWeight:800,color:"#00d4aa",fontFamily:"'Space Grotesk',monospace"}}>{fmtUSD(lp.swapVolumeUSD)}</div></div>
+          <div style={{textAlign:"right",minWidth:60}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>⇄ Swaps</div><div style={{fontSize:15,fontWeight:800,color:"#e2e8f0",fontFamily:"'Space Grotesk',monospace"}}>{lp.swaps}</div></div>
+          <div style={{textAlign:"right",minWidth:55}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>Days</div><div style={{fontSize:15,fontWeight:800,color:"#718096",fontFamily:"'Space Grotesk',monospace"}}>{lp.daysActive}</div></div>
+          <div style={{textAlign:"right",minWidth:85}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>Last Seen</div><div style={{fontSize:12,fontWeight:700,color:"#e2e8f0"}}>{lp.lastSeen?timeAgo(lp.lastSeen):"—"}</div></div>
+        </>}
+        {isMobile&&<div style={{textAlign:"right",flexShrink:0}}><div style={{fontSize:13,fontWeight:800,color:"#f59e0b",fontFamily:"'Space Grotesk',monospace"}}>{lp.sp.toLocaleString()} SP</div><div style={{fontSize:11,color:"#00d4aa"}}>{fmtUSD(lp.swapVolumeUSD)}</div></div>}
+        <div style={{color:"#4a5568",fontSize:11,flexShrink:0}}>{expanded?"▲":"▼"}</div>
+      </div>
+      {expanded&&(
+        <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid #1e293b"}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:8,marginBottom:10}}>
+            {[
+              {l:"SP Score",     v:`${lp.sp.toLocaleString()} SP`, c:"#f59e0b"},
+              {l:"Swap Volume",  v:fmtUSD(lp.swapVolumeUSD),       c:"#00d4aa"},
+              {l:"Swaps",        v:lp.swaps,                        c:"#e2e8f0"},
+              {l:"Claims",       v:lp.claims,                       c:"#8b5cf6"},
+              {l:"Days Active",  v:lp.daysActive,                   c:"#718096"},
+              {l:"Last Seen",    v:lp.lastSeen?timeAgo(lp.lastSeen):"—", c:"#718096"},
+            ].map(s=>(
+              <div key={s.l} style={{background:`${s.c}10`,border:`1px solid ${s.c}22`,borderRadius:8,padding:"8px 10px"}}>
+                <div style={{fontSize:10,color:"#4a5568"}}>{s.l}</div>
+                <div style={{fontSize:13,fontWeight:700,color:s.c,fontFamily:"'Space Grotesk',monospace"}}>{s.v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center",justifyContent:"space-between",flexWrap:"wrap"}}>
+            <a href={`https://sepolia.etherscan.io/address/${lp.address}`} target="_blank" rel="noreferrer" onClick={e=>e.stopPropagation()} style={{fontSize:11,color:"#4a5568",fontFamily:"monospace",textDecoration:"none"}}>{lp.address} ↗</a>
+            <button onClick={e=>{e.stopPropagation();onView(lp);}} style={{background:"#00d4aa18",border:"1px solid #00d4aa44",color:"#00d4aa",borderRadius:6,padding:"5px 12px",fontSize:11,cursor:"pointer",fontWeight:700}}>View Activity →</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── ACTIVITY TRACKER ───────────────────────────────────────
+function ActivityTracker({ isMobile, jumpWallet }) {
   const [input,   setInput]   = useState("");
-  const [wallet,  setWallet]  = useState("");
+  const [wallet,  setWallet]  = useState(jumpWallet||"");
   const [events,  setEvents]  = useState([]);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState("");
@@ -267,59 +353,208 @@ export default function App() {
   const [range,   setRange]   = useState("daily");
   const [filter,  setFilter]  = useState("all");
 
+  useEffect(()=>{ if(jumpWallet){ setWallet(jumpWallet); runSearch(jumpWallet); } },[jumpWallet]);
+
   const runSearch = useCallback(async(addr)=>{
-    const a = (addr||input).trim();
+    const a=(addr||input).trim();
     if(!a||a.length<10) return;
     setLoading(true);setError("");setEvents([]);setDone(false);setWallet(a);
     try {
       const txs = await getWalletData(a);
       setEvents(txs);
-      if(txs.length===0) setError("No Stabilizer transactions found for this wallet on Sepolia testnet.");
-    } catch(e) { setError("Failed to fetch data. Please check the address and try again."); }
+      if(!txs.length) setError("No Stabilizer swap or claim transactions found for this wallet.");
+    } catch { setError("Failed to fetch. Please try again."); }
     setLoading(false);setDone(true);
   },[input]);
 
-  // Range filter for chart
   const rangeMs   = range==="daily"?7*86400:range==="weekly"?28*86400:180*86400;
   const chartEvts = useMemo(()=>events.filter(e=>Math.floor(Date.now()/1000)-parseInt(e.timeStamp)<=rangeMs),[events,rangeMs]);
   const displayed = useMemo(()=>filter==="all"?events:events.filter(e=>e.txType===filter),[events,filter]);
 
-  // Period stats (for selected range)
+  const totalVol     = events.filter(e=>e.txType==="swap").reduce((s,e)=>s+e.volumeUSD,0);
+  const totalSP      = calcSP(totalVol);
+  const swapCount    = events.filter(e=>e.txType==="swap").length;
+  const claimCount   = events.filter(e=>e.txType==="claim").length;
+  const lastSeen     = events.length?events[0].timeStamp:null;
+  const firstSeen    = events.length?events[events.length-1].timeStamp:null;
+  const daysActive   = firstSeen?Math.max(1,Math.ceil((Math.floor(Date.now()/1000)-parseInt(firstSeen))/86400)):0;
+  const tier         = getTier(totalSP);
+
   const periodStats = useMemo(()=>{
-    const s={swaps:0,deposits:0,claims:0,swapVol:0,totalVol:0};
+    const s={swaps:0,vol:0,claims:0};
     chartEvts.forEach(e=>{
-      s.totalVol+=e.volumeUSD||0;
-      if(e.txType==="swap")    {s.swaps++;   s.swapVol+=e.volumeUSD||0;}
-      if(e.txType==="deposit") {s.deposits++;}
-      if(e.txType==="claim")   {s.claims++;}
+      if(e.txType==="swap"){s.swaps++;s.vol+=e.volumeUSD||0;}
+      if(e.txType==="claim") s.claims++;
     });
     return s;
   },[chartEvts]);
 
-  // Overall stats
-  const totalVol     = events.reduce((s,e)=>s+e.volumeUSD,0);
-  const totalSwapVol = events.filter(e=>e.txType==="swap").reduce((s,e)=>s+e.volumeUSD,0);
-  const totalSP      = calcSP(totalVol);
-  const swapCount    = events.filter(e=>e.txType==="swap").length;
-  const depositCount = events.filter(e=>e.txType==="deposit").length;
-  const claimCount   = events.filter(e=>e.txType==="claim").length;
-  const lastSeen     = events.length ? events[0].timeStamp : null;
-  const firstSeen    = events.length ? events[events.length-1].timeStamp : null;
-  const daysActive   = firstSeen ? Math.max(1,Math.ceil((Math.floor(Date.now()/1000)-parseInt(firstSeen))/86400)) : 0;
-  const tier         = getTier(totalSP);
+  const sec={background:"#0d1525",border:"1px solid #1e293b",borderRadius:14,padding:isMobile?14:20};
 
-  const poolBreak = useMemo(()=>{
-    const m={};
-    events.forEach(e=>{
-      if(!m[e.poolKey]) m[e.poolKey]={count:0,vol:0,swaps:0};
-      m[e.poolKey].count++;
-      m[e.poolKey].vol+=e.volumeUSD||0;
-      if(e.txType==="swap") m[e.poolKey].swaps++;
-    });
-    return m;
-  },[events]);
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:18}}>
+      {/* Search */}
+      <div style={sec}>
+        <div style={{fontSize:12,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12}}>🔍 Wallet Activity Tracker</div>
+        <div style={{display:"flex",gap:10}}>
+          <input type="text" placeholder="Enter Sepolia wallet address (0x...)"
+            value={input} onChange={e=>setInput(e.target.value)}
+            onKeyDown={e=>e.key==="Enter"&&runSearch(input)}
+            style={{flex:1,background:"#060b18",border:"1.5px solid #2d3748",color:"#e2e8f0",borderRadius:10,padding:"12px 16px",fontSize:15,fontFamily:"'Space Grotesk',monospace"}}
+          />
+          <button onClick={()=>runSearch(input)} disabled={loading} style={{background:"linear-gradient(135deg,#00d4aa,#0088ff)",border:"none",borderRadius:10,padding:"0 22px",color:"#060b18",fontWeight:800,fontSize:14,cursor:"pointer",opacity:loading?0.7:1,minWidth:90}}>
+            {loading?"...":"Search"}
+          </button>
+        </div>
+        <div style={{fontSize:11,color:"#4a5568",marginTop:8}}>Tracks Swaps & Claim Fee transactions · Router + T/C/S/P-Pool on Sepolia</div>
+      </div>
 
-  const sec = {background:"#0d1525",border:"1px solid #1e293b",borderRadius:14,padding:isMobile?14:20};
+      {loading&&<Spinner text="Fetching all transactions from Sepolia... this may take a moment"/>}
+      {!loading&&error&&<div style={{background:"#ef444415",border:"1px solid #ef444433",borderRadius:12,padding:"16px 20px",fontSize:13,color:"#ef4444"}}>{error}</div>}
+
+      {!loading&&done&&events.length>0&&<>
+        {/* Hero card */}
+        <div style={{background:`linear-gradient(135deg,${tier.color}12,#0d1525)`,border:`2px solid ${tier.color}44`,borderRadius:18,padding:isMobile?18:28}}>
+          <div style={{display:"flex",alignItems:"flex-start",gap:14,marginBottom:20,flexWrap:"wrap"}}>
+            <div style={{width:52,height:52,borderRadius:"50%",background:`linear-gradient(135deg,${tier.color},#1e293b)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,fontWeight:800,color:"#060b18",flexShrink:0}}>{wallet[2]?.toUpperCase()}</div>
+            <div style={{flex:1,minWidth:180}}>
+              <div style={{fontSize:15,fontWeight:700,color:"#e2e8f0",fontFamily:"'Space Grotesk',monospace",marginBottom:6}}>{shortAddr(wallet)}</div>
+              <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                <TierBadge sp={totalSP}/>
+                <span style={{fontSize:12,color:"#4a5568"}}>{daysActive} days active</span>
+                {lastSeen&&<span style={{fontSize:12,color:"#00d4aa",fontWeight:600}}>Last seen: {timeAgo(lastSeen)}</span>}
+              </div>
+            </div>
+            <a href={`https://sepolia.etherscan.io/address/${wallet}`} target="_blank" rel="noreferrer" style={{fontSize:12,color:"#00d4aa",textDecoration:"none",border:"1px solid #00d4aa44",borderRadius:8,padding:"6px 14px",flexShrink:0}}>Etherscan ↗</a>
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:12,marginBottom:16}}>
+            <StatBox label="⭐ SP Score"    value={totalSP.toLocaleString()} color="#f59e0b" sub="1 SP per $1,000 vol"/>
+            <StatBox label="💰 Swap Volume" value={fmtUSD(totalVol)}         color="#00d4aa"/>
+            <StatBox label="⇄ Swaps"       value={swapCount}                 color="#e2e8f0"/>
+            <StatBox label="★ Claims"       value={claimCount}                color="#8b5cf6"/>
+          </div>
+        </div>
+
+        {/* Chart */}
+        <div style={sec}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:10}}>
+            <div>
+              <div style={{fontSize:12,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>Swap Volume Activity</div>
+              <div style={{fontSize:13,color:"#718096"}}>
+                <span style={{color:"#00d4aa",fontWeight:700}}>{fmtUSD(periodStats.vol)}</span>
+                <span style={{margin:"0 8px"}}>·</span>
+                <span style={{color:"#e2e8f0"}}>{periodStats.swaps} swaps</span>
+                <span style={{margin:"0 8px"}}>·</span>
+                <span style={{color:"#f59e0b"}}>+{calcSP(periodStats.vol)} SP earned</span>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              {[{k:"daily",l:"Daily"},{k:"weekly",l:"Weekly"},{k:"monthly",l:"Monthly"}].map(o=>(
+                <button key={o.k} onClick={()=>setRange(o.k)} style={{background:range===o.k?"#00d4aa22":"transparent",border:`1px solid ${range===o.k?"#00d4aa":"#2d3748"}`,color:range===o.k?"#00d4aa":"#718096",borderRadius:6,padding:"6px 14px",fontSize:12,cursor:"pointer",fontWeight:600}}>{o.l}</button>
+              ))}
+            </div>
+          </div>
+          <ActivityChart events={chartEvts.filter(e=>e.txType==="swap")} range={range} isMobile={isMobile}/>
+        </div>
+
+        {/* Filter tabs */}
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          {[
+            {k:"all",   l:`All (${events.length})`,      c:"#718096"},
+            {k:"swap",  l:`⇄ Swaps (${swapCount})`,     c:"#f59e0b"},
+            {k:"claim", l:`★ Claim Fees (${claimCount})`,c:"#8b5cf6"},
+          ].map(f=>(
+            <button key={f.k} onClick={()=>setFilter(f.k)} style={{background:filter===f.k?`${f.c}18`:"transparent",border:`1.5px solid ${filter===f.k?f.c:"#2d3748"}`,color:filter===f.k?f.c:"#4a5568",borderRadius:8,padding:"8px 16px",fontSize:12,cursor:"pointer",fontWeight:600}}>{f.l}</button>
+          ))}
+        </div>
+
+        {/* Transaction feed */}
+        <div style={{background:"#0d1525",border:"1px solid #1e293b",borderRadius:14,overflow:"hidden"}}>
+          {!isMobile&&(
+            <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr",gap:12,padding:"10px 16px",background:"#060b18",fontSize:10,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.08em",borderBottom:"1px solid #1e293b"}}>
+              <div>Transaction</div><div>Volume</div><div>SP Earned</div><div>Date</div>
+            </div>
+          )}
+          <div style={{maxHeight:500,overflowY:"auto"}}>
+            {displayed.length===0
+              ?<div style={{padding:"40px",textAlign:"center",color:"#4a5568"}}>No transactions.</div>
+              :displayed.map((tx,i)=>{
+                const isSwap = tx.txType==="swap";
+                const info = isSwap
+                  ? {label:"Swap",color:"#f59e0b",icon:"⇄"}
+                  : {label:"Claim Fees",color:"#8b5cf6",icon:"★"};
+                const sp = calcSP(tx.volumeUSD||0);
+                return (
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderBottom:"1px solid #0f1a2e",background:i%2===0?"transparent":"#060b1844"}}>
+                    <div style={{width:36,height:36,borderRadius:8,flexShrink:0,background:`${info.color}15`,border:`1px solid ${info.color}33`,display:"flex",alignItems:"center",justifyContent:"center",color:info.color,fontSize:16,fontWeight:800}}>{info.icon}</div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:3}}>
+                        <span style={{fontSize:13,fontWeight:700,color:info.color}}>{info.label}</span>
+                        <span style={{fontSize:11,background:`${POOLS[tx.poolKey].color}18`,color:POOLS[tx.poolKey].color,borderRadius:4,padding:"1px 6px"}}>{tx.poolLabel}</span>
+                        {isSwap&&tx.volumeUSD>0&&<span style={{fontSize:13,color:"#00d4aa",fontFamily:"'Space Grotesk',monospace",fontWeight:700}}>{fmtUSD(tx.volumeUSD)}</span>}
+                        {isSwap&&sp>0&&<span style={{fontSize:11,color:"#f59e0b"}}>+{sp} SP</span>}
+                      </div>
+                      <div style={{fontSize:11,color:"#4a5568",display:"flex",gap:8}}>
+                        <span>{fmtDate(tx.timeStamp)}</span>
+                        <span>·</span>
+                        <a href={`https://sepolia.etherscan.io/tx/${tx.hash}`} target="_blank" rel="noreferrer" style={{color:"#2d3748",textDecoration:"none"}}>{tx.hash.slice(0,10)}...↗</a>
+                      </div>
+                    </div>
+                    <div style={{fontSize:11,color:"#22c55e",fontWeight:700,flexShrink:0}}>✓</div>
+                  </div>
+                );
+              })
+            }
+          </div>
+        </div>
+      </>}
+
+      {!loading&&!done&&(
+        <div style={{textAlign:"center",padding:"80px 20px",color:"#4a5568",lineHeight:2.4}}>
+          <div style={{fontSize:52,marginBottom:16}}>🔍</div>
+          <div style={{fontSize:16,fontWeight:700,color:"#718096",marginBottom:8}}>Track any Stabilizer wallet</div>
+          <div style={{fontSize:13}}>Swap count · Volume · SP score<br/>Daily / Weekly / Monthly activity</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── MAIN APP ───────────────────────────────────────────────
+export default function App() {
+  const isMobile    = useIsMobile();
+  const [tab,       setTab]       = useState("leaderboard");
+  const [sortBy,    setSortBy]    = useState("sp");
+  const [search,    setSearch]    = useState("");
+  const [tierF,     setTierF]     = useState("all");
+  const [expanded,  setExpanded]  = useState(null);
+  const [board,     setBoard]     = useState([]);
+  const [loading,   setLoading]   = useState(false);
+  const [updated,   setUpdated]   = useState(null);
+  const [showAll,   setShowAll]   = useState(false);
+  const [jumpWallet,setJumpWallet]= useState(null);
+
+  const loadBoard = useCallback(async()=>{
+    setLoading(true);
+    const data = await buildLeaderboard();
+    setBoard(data);setUpdated(new Date());setLoading(false);
+  },[]);
+
+  useEffect(()=>{ loadBoard(); },[]);
+
+  const sorted = useMemo(()=>{
+    let d=[...board];
+    if(tierF!=="all"){const t=TIERS.find(x=>x.name===tierF),nx=TIERS[TIERS.indexOf(t)-1];d=d.filter(w=>w.sp>=t.minSP&&(!nx||w.sp<nx.minSP));}
+    if(search.trim()){const q=search.toLowerCase();d=d.filter(w=>w.address.toLowerCase().includes(q));}
+    d.sort((a,b)=>sortBy==="swaps"?b.swaps-a.swaps:sortBy==="lastSeen"?b.lastSeen-a.lastSeen:b.sp-a.sp);
+    return d;
+  },[board,tierF,search,sortBy]);
+
+  const displayed=showAll?sorted:sorted.slice(0,25);
+  const totalSP  =board.reduce((s,w)=>s+w.sp,0);
+  const totalVol =board.reduce((s,w)=>s+w.swapVolumeUSD,0);
+  const sec={background:"#0d1525",border:"1px solid #1e293b",borderRadius:14,padding:16};
 
   return (
     <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#060b18 0%,#080d1a 50%,#06101f 100%)",fontFamily:"'Inter','Segoe UI',sans-serif",color:"#e2e8f0"}}>
@@ -331,252 +566,114 @@ export default function App() {
       `}</style>
 
       {/* Header */}
-      <div style={{background:"linear-gradient(180deg,#0a1628 0%,transparent 100%)",borderBottom:"1px solid #1e293b",padding:isMobile?"16px":"20px 28px",position:"sticky",top:0,zIndex:50,backdropFilter:"blur(12px)"}}>
-        <div style={{maxWidth:860,margin:"0 auto",display:"flex",alignItems:"center",gap:14}}>
-          <div style={{width:40,height:40,borderRadius:12,flexShrink:0,background:"linear-gradient(135deg,#00d4aa,#0088ff)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#060b18"}}>S</div>
+      <div style={{background:"linear-gradient(180deg,#0a1628 0%,transparent 100%)",borderBottom:"1px solid #1e293b",padding:isMobile?"14px 16px":"18px 24px",position:"sticky",top:0,zIndex:50,backdropFilter:"blur(12px)"}}>
+        <div style={{maxWidth:960,margin:"0 auto",display:"flex",alignItems:"center",gap:12}}>
+          <div style={{width:38,height:38,borderRadius:10,flexShrink:0,background:"linear-gradient(135deg,#00d4aa,#0088ff)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#060b18"}}>S</div>
           <div>
-            <div style={{fontSize:10,color:"#4a5568",letterSpacing:"0.12em",textTransform:"uppercase"}}>Stabilizer Protocol · Sepolia Testnet</div>
-            <div style={{fontSize:isMobile?18:24,fontWeight:800,color:"#f0f4f8",fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"-0.03em"}}>Activity Tracker</div>
+            <div style={{fontSize:10,color:"#4a5568",letterSpacing:"0.1em",textTransform:"uppercase"}}>Stabilizer Protocol · Sepolia Testnet</div>
+            <div style={{fontSize:isMobile?16:20,fontWeight:800,color:"#f0f4f8",fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"-0.02em"}}>{tab==="leaderboard"?"SP Leaderboard":"Activity Tracker"}</div>
           </div>
-          <div style={{marginLeft:"auto",fontSize:10,color:"#4a5568",textAlign:"right"}}>
-            <div style={{color:"#00d4aa",marginBottom:2}}>🔴 Live</div>
-            <div>Sepolia Testnet</div>
+          <div style={{marginLeft:"auto",display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+            {updated&&<div style={{fontSize:10,color:"#00d4aa"}}>Live · {updated.toLocaleTimeString()}</div>}
+            <button onClick={loadBoard} disabled={loading} style={{background:"#0d1525",border:"1px solid #2d3748",color:"#718096",borderRadius:6,padding:"4px 10px",fontSize:11,cursor:"pointer"}}>{loading?"Loading...":"↻ Refresh"}</button>
           </div>
         </div>
       </div>
 
-      <div style={{maxWidth:860,margin:"0 auto",padding:isMobile?"16px":"24px",display:"flex",flexDirection:"column",gap:18}}>
-
-        {/* Search */}
-        <div style={sec}>
-          <div style={{fontSize:12,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12,display:"flex",alignItems:"center",gap:8}}>
-            <span style={{fontSize:16}}>🔍</span> Wallet Activity Tracker
-          </div>
-          <div style={{display:"flex",gap:10}}>
-            <input type="text"
-              placeholder="Enter Sepolia wallet address (0x...)"
-              value={input}
-              onChange={e=>setInput(e.target.value)}
-              onKeyDown={e=>e.key==="Enter"&&runSearch(input)}
-              style={{flex:1,background:"#060b18",border:"1.5px solid #2d3748",color:"#e2e8f0",borderRadius:10,padding:"12px 16px",fontSize:15,fontFamily:"'Space Grotesk',monospace"}}
-            />
-            <button onClick={()=>runSearch(input)} disabled={loading} style={{
-              background:"linear-gradient(135deg,#00d4aa,#0088ff)",border:"none",borderRadius:10,
-              padding:"0 22px",color:"#060b18",fontWeight:800,fontSize:14,cursor:"pointer",
-              opacity:loading?0.7:1,whiteSpace:"nowrap",minWidth:90
-            }}>{loading?"...":"Search"}</button>
-          </div>
-          <div style={{fontSize:11,color:"#4a5568",marginTop:10,lineHeight:1.6}}>
-            Tracks Swaps · Add Liquidity · Claim Fees across T-Pool, C-Pool, S-Pool, P-Pool on Sepolia
-          </div>
+      {/* Tabs */}
+      <div style={{borderBottom:"1px solid #1e293b",background:"#0a0f1e",position:"sticky",top:isMobile?62:70,zIndex:40}}>
+        <div style={{maxWidth:960,margin:"0 auto",display:"flex"}}>
+          {[{k:"leaderboard",l:"🏆 SP Leaderboard"},{k:"activity",l:"📊 Activity Tracker"}].map(t=>(
+            <button key={t.k} onClick={()=>setTab(t.k)} style={{flex:1,padding:"11px",border:"none",cursor:"pointer",background:"none",fontSize:13,fontWeight:600,color:tab===t.k?"#00d4aa":"#4a5568",borderBottom:`2px solid ${tab===t.k?"#00d4aa":"transparent"}`,transition:"all 0.2s"}}>{t.l}</button>
+          ))}
         </div>
+      </div>
 
-        {/* Loading */}
-        {loading&&<Spinner text="Fetching all wallet transactions from Sepolia..."/>}
+      <div style={{maxWidth:960,margin:"0 auto",padding:isMobile?"14px":"20px"}}>
+        {tab==="activity"?<ActivityTracker isMobile={isMobile} jumpWallet={jumpWallet}/>:(<>
 
-        {/* Error */}
-        {!loading&&error&&(
-          <div style={{background:"#ef444415",border:"1px solid #ef444433",borderRadius:12,padding:"16px 20px",fontSize:13,color:"#ef4444"}}>{error}</div>
-        )}
-
-        {/* Results */}
-        {!loading&&done&&events.length>0&&<>
-
-          {/* Wallet hero card */}
-          <div style={{background:`linear-gradient(135deg,${tier.color}12,#0d1525)`,border:`2px solid ${tier.color}44`,borderRadius:18,padding:isMobile?18:28}}>
-            <div style={{display:"flex",alignItems:"flex-start",gap:14,marginBottom:20,flexWrap:"wrap"}}>
-              <div style={{width:52,height:52,borderRadius:"50%",background:`linear-gradient(135deg,${tier.color},#1e293b)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,fontWeight:800,color:"#060b18",flexShrink:0}}>
-                {wallet[2]?.toUpperCase()}
-              </div>
-              <div style={{flex:1,minWidth:200}}>
-                <div style={{fontSize:15,fontWeight:700,color:"#e2e8f0",fontFamily:"'Space Grotesk',monospace",marginBottom:6}}>{shortAddr(wallet)}</div>
-                <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                  <TierBadge sp={totalSP}/>
-                  <span style={{fontSize:12,color:"#4a5568"}}>{daysActive} days active</span>
-                  {lastSeen&&<span style={{fontSize:12,color:"#00d4aa",fontWeight:600}}>Last seen: {timeAgo(lastSeen)}</span>}
-                </div>
-              </div>
-              <a href={`https://sepolia.etherscan.io/address/${wallet}`} target="_blank" rel="noreferrer"
-                style={{fontSize:12,color:"#00d4aa",textDecoration:"none",border:"1px solid #00d4aa44",borderRadius:8,padding:"6px 14px",whiteSpace:"nowrap",flexShrink:0}}>
-                View on Etherscan ↗
-              </a>
-            </div>
-
-            {/* SP + volume hero */}
-            <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:12,marginBottom:16}}>
-              <StatBox label="⭐ SP Score"     value={`${totalSP.toLocaleString()}`} color="#f59e0b" sub="1 SP per $1,000 vol" big/>
-              <StatBox label="💰 Total Volume"  value={fmtUSD(totalVol)}              color="#00d4aa"/>
-              <StatBox label="⇄ Swap Volume"   value={fmtUSD(totalSwapVol)}           color="#22c55e"/>
-              <StatBox label="📊 Total Txns"   value={events.length}                  color="#e2e8f0"/>
-            </div>
-
-            {/* Tx type breakdown */}
-            <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:16}}>
-              {[
-                {l:"Swaps",         v:swapCount,    c:"#f59e0b", icon:"⇄"},
-                {l:"Add Liquidity", v:depositCount, c:"#00d4aa", icon:"+"},
-                {l:"Claim Fees",    v:claimCount,   c:"#8b5cf6", icon:"★"},
-              ].map(s=>(
-                <div key={s.l} style={{background:`${s.c}12`,border:`1px solid ${s.c}33`,borderRadius:10,padding:"8px 14px",display:"flex",alignItems:"center",gap:8}}>
-                  <span style={{color:s.c,fontSize:16}}>{s.icon}</span>
-                  <div>
-                    <div style={{fontSize:10,color:"#4a5568"}}>{s.l}</div>
-                    <div style={{fontSize:17,fontWeight:800,color:s.c,fontFamily:"'Space Grotesk',monospace"}}>{s.v}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            {/* Pool breakdown */}
-            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              {Object.entries(poolBreak).map(([k,v])=>(
-                <div key={k} style={{background:`${POOLS[k].color}15`,border:`1px solid ${POOLS[k].color}33`,borderRadius:10,padding:"8px 14px"}}>
-                  <div style={{fontSize:10,color:POOLS[k].color,fontWeight:700,marginBottom:2}}>{POOLS[k].label}</div>
-                  <div style={{fontSize:13,fontWeight:700,color:"#e2e8f0",fontFamily:"'Space Grotesk',monospace"}}>{v.count} txns</div>
-                  {v.vol>0&&<div style={{fontSize:11,color:"#00d4aa"}}>{fmtUSD(v.vol)}</div>}
-                </div>
-              ))}
-            </div>
+          <div style={{background:"#f59e0b0d",border:"1px solid #f59e0b22",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:"#718096",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:16}}>⭐</span>
+            <span>SP Score = 1 point per $1,000 swap volume · Ranked by SP · Live from Sepolia Router</span>
           </div>
 
-          {/* Chart + range */}
-          <div style={sec}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8,flexWrap:"wrap",gap:10}}>
-              <div>
-                <div style={{fontSize:12,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:4}}>Volume Activity</div>
-                <div style={{fontSize:13,color:"#718096"}}>
-                  <span style={{color:"#00d4aa",fontWeight:700}}>{fmtUSD(periodStats.totalVol)}</span> vol ·
-                  <span style={{color:"#f59e0b",fontWeight:700,marginLeft:6}}>{periodStats.swaps} swaps</span> ·
-                  <span style={{color:"#f59e0b",marginLeft:6}}>+{calcSP(periodStats.totalVol)} SP</span>
+          {loading?<Spinner text="Fetching leaderboard from Sepolia..."/>:(<>
+            <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:12,marginBottom:16}}>
+              {[
+                {icon:"👛",label:"Active Wallets", value:board.length,             color:"#00d4aa"},
+                {icon:"⭐",label:"Total SP",        value:totalSP.toLocaleString(), color:"#f59e0b"},
+                {icon:"💰",label:"Total Volume",    value:fmtUSD(totalVol),          color:"#00d4aa"},
+                {icon:"⇄",label:"Total Swaps",    value:board.reduce((s,w)=>s+w.swaps,0), color:"#e2e8f0"},
+              ].map((s,i)=>(
+                <div key={i} style={{background:"#0d1525",border:"1px solid #1e293b",borderRadius:12,padding:"14px 16px"}}>
+                  <div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>{s.icon} {s.label}</div>
+                  <div style={{fontSize:isMobile?17:21,fontWeight:800,color:s.color,fontFamily:"'Space Grotesk',monospace"}}>{s.value}</div>
                 </div>
-              </div>
-              <div style={{display:"flex",gap:6}}>
-                {[{k:"daily",l:"Daily"},{k:"weekly",l:"Weekly"},{k:"monthly",l:"Monthly"}].map(o=>(
-                  <button key={o.k} onClick={()=>setRange(o.k)} style={{
-                    background:range===o.k?"#00d4aa22":"transparent",
-                    border:`1px solid ${range===o.k?"#00d4aa":"#2d3748"}`,
-                    color:range===o.k?"#00d4aa":"#718096",
-                    borderRadius:6,padding:"6px 14px",fontSize:12,cursor:"pointer",fontWeight:600
-                  }}>{o.l}</button>
+              ))}
+            </div>
+
+            {/* Tier filter */}
+            <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
+              <button onClick={()=>setTierF("all")} style={{background:tierF==="all"?"#ffffff15":"transparent",border:`1px solid ${tierF==="all"?"#ffffff44":"#2d3748"}`,color:tierF==="all"?"#e2e8f0":"#4a5568",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>All Tiers</button>
+              {TIERS.map(t=>{
+                const cnt=board.filter(w=>{const nx=TIERS[TIERS.indexOf(t)-1];return w.sp>=t.minSP&&(!nx||w.sp<nx.minSP);}).length;
+                return <button key={t.name} onClick={()=>setTierF(tierF===t.name?"all":t.name)} style={{background:tierF===t.name?`${t.color}18`:"transparent",border:`1px solid ${tierF===t.name?t.color:"#2d3748"}`,color:tierF===t.name?t.color:"#4a5568",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>{t.icon} {t.name} <span style={{opacity:0.6}}>({cnt})</span></button>;
+              })}
+            </div>
+
+            <div style={{...sec,marginBottom:14,display:"flex",flexDirection:"column",gap:12}}>
+              <input type="text" placeholder="Search by wallet address..." value={search} onChange={e=>setSearch(e.target.value)}
+                style={{width:"100%",background:"#0a0f1e",border:"1px solid #2d3748",color:"#e2e8f0",borderRadius:10,padding:"10px 14px",fontSize:14,fontFamily:"'Space Grotesk',monospace"}}
+              />
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {[{k:"sp",l:"⭐ SP Score"},{k:"swaps",l:"⇄ Swaps"},{k:"lastSeen",l:"🕒 Recent"}].map(o=>(
+                  <button key={o.k} onClick={()=>setSortBy(o.k)} style={{background:sortBy===o.k?"#00d4aa22":"transparent",border:`1.5px solid ${sortBy===o.k?"#00d4aa":"#2d3748"}`,color:sortBy===o.k?"#00d4aa":"#718096",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>{o.l}</button>
                 ))}
               </div>
             </div>
-            <ActivityChart events={chartEvts} range={range} isMobile={isMobile}/>
-          </div>
 
-          {/* Period breakdown cards */}
-          <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr":"repeat(3,1fr)",gap:12}}>
-            {[
-              {icon:"⭐",label:"SP Earned (period)",  value:`${calcSP(periodStats.totalVol)} SP`,      color:"#f59e0b"},
-              {icon:"💰",label:"Volume (period)",      value:fmtUSD(periodStats.totalVol),               color:"#00d4aa"},
-              {icon:"⇄",label:"Swaps (period)",      value:`${periodStats.swaps} · ${fmtUSD(periodStats.swapVol)}`, color:"#e2e8f0"},
-            ].map(s=>(
-              <div key={s.label} style={{background:"#0d1525",border:`1px solid ${s.color}22`,borderRadius:12,padding:"16px 18px"}}>
-                <div style={{fontSize:16,marginBottom:6}}>{s.icon}</div>
-                <div style={{fontSize:11,color:"#4a5568",marginBottom:4}}>{s.label}</div>
-                <div style={{fontSize:18,fontWeight:800,color:s.color,fontFamily:"'Space Grotesk',monospace"}}>{s.value}</div>
+            {!isMobile&&(
+              <div style={{display:"flex",alignItems:"center",gap:14,padding:"0 18px 8px",fontSize:10,color:"#4a5568",letterSpacing:"0.08em",textTransform:"uppercase"}}>
+                <div style={{minWidth:32}}>Rank</div>
+                <div style={{flex:1}}>Wallet</div>
+                <div style={{minWidth:90,textAlign:"right"}}>⭐ SP</div>
+                <div style={{minWidth:100,textAlign:"right"}}>💰 Swap Vol</div>
+                <div style={{minWidth:60,textAlign:"right"}}>⇄ Swaps</div>
+                <div style={{minWidth:55,textAlign:"right"}}>Days</div>
+                <div style={{minWidth:85,textAlign:"right"}}>Last Seen</div>
+                <div style={{minWidth:20}}></div>
               </div>
-            ))}
-          </div>
+            )}
 
-          {/* Filter + feed */}
-          <div style={sec}>
-            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:14}}>
-              {[
-                {k:"all",     l:"All Transactions", c:"#718096"},
-                {k:"swap",    l:"⇄ Swaps",          c:"#f59e0b"},
-                {k:"deposit", l:"+ Add Liquidity",   c:"#00d4aa"},
-                {k:"claim",   l:"★ Claim Fees",      c:"#8b5cf6"},
-              ].map(f=>(
-                <button key={f.k} onClick={()=>setFilter(f.k)} style={{
-                  background:filter===f.k?`${f.c}18`:"transparent",
-                  border:`1.5px solid ${filter===f.k?f.c:"#2d3748"}`,
-                  color:filter===f.k?f.c:"#4a5568",
-                  borderRadius:8,padding:"6px 14px",fontSize:12,cursor:"pointer",fontWeight:600
-                }}>{f.l} {filter===f.k&&`(${displayed.length})`}</button>
+            {sorted.length===0
+              ?<div style={{textAlign:"center",padding:"40px",color:"#4a5568"}}>No wallets found.</div>
+              :displayed.map((lp,i)=>(
+                <LeaderRow key={lp.address} lp={lp} rank={i+1} isMobile={isMobile}
+                  expanded={expanded===i} onToggle={()=>setExpanded(expanded===i?null:i)}
+                  onView={lp=>{setJumpWallet(lp.address);setTab("activity");}}
+                />
+              ))
+            }
+
+            {sorted.length>25&&(
+              <button onClick={()=>setShowAll(v=>!v)} style={{width:"100%",padding:"12px",background:"#0d1525",border:"1px solid #2d3748",color:"#718096",borderRadius:12,cursor:"pointer",fontSize:13,fontWeight:600,marginTop:4}}>
+                {showAll?`Show less ▲`:`Show all ${sorted.length} wallets ▼`}
+              </button>
+            )}
+
+            <div style={{display:"flex",gap:12,flexWrap:"wrap",marginTop:16,paddingTop:16,borderTop:"1px solid #1e293b"}}>
+              {Object.entries(POOLS).map(([k,v])=>(
+                <div key={k} style={{display:"flex",alignItems:"center",gap:6}}>
+                  <div style={{width:8,height:8,borderRadius:"50%",background:v.color}}/>
+                  <span style={{fontSize:11,color:"#4a5568"}}>{v.label} · {v.token}</span>
+                </div>
               ))}
             </div>
+          </>)}
+        </>)}
 
-            {/* Transaction list */}
-            <div style={{maxHeight:500,overflowY:"auto",borderRadius:10,border:"1px solid #1a2035",overflow:"hidden"}}>
-              {/* Header row */}
-              {!isMobile&&(
-                <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 80px",gap:12,padding:"10px 16px",background:"#060b18",fontSize:10,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.08em",borderBottom:"1px solid #1e293b"}}>
-                  <div>Transaction</div>
-                  <div>Pool</div>
-                  <div>Volume</div>
-                  <div>SP Earned</div>
-                  <div>Date</div>
-                </div>
-              )}
-              <div style={{maxHeight:isMobile?440:460,overflowY:"auto"}}>
-                {displayed.length===0
-                  ?<div style={{padding:"40px",textAlign:"center",color:"#4a5568",fontSize:13}}>No transactions found.</div>
-                  :displayed.map((tx,i)=>{
-                    const typeInfo = {
-                      swap:    {label:"Swap",         color:"#f59e0b", icon:"⇄"},
-                      deposit: {label:"Add Liquidity", color:"#00d4aa", icon:"+"},
-                      claim:   {label:"Claim Fees",    color:"#8b5cf6", icon:"★"},
-                    }[tx.txType] || {label:"Tx",color:"#718096",icon:"·"};
-                    const pool = POOLS[tx.poolKey];
-                    const sp = calcSP(tx.volumeUSD||0);
-
-                    return (
-                      <div key={i} style={{
-                        display:"flex",alignItems:"center",gap:12,padding:"12px 16px",
-                        borderBottom:"1px solid #0f1a2e",
-                        background:i%2===0?"transparent":"#060b1844"
-                      }}>
-                        {/* Type icon */}
-                        <div style={{width:36,height:36,borderRadius:8,flexShrink:0,background:`${typeInfo.color}15`,border:`1px solid ${typeInfo.color}33`,display:"flex",alignItems:"center",justifyContent:"center",color:typeInfo.color,fontSize:16,fontWeight:800}}>
-                          {typeInfo.icon}
-                        </div>
-
-                        {/* Info */}
-                        <div style={{flex:1,minWidth:0}}>
-                          <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
-                            <span style={{fontSize:13,fontWeight:700,color:typeInfo.color}}>{typeInfo.label}</span>
-                            <span style={{fontSize:11,background:`${pool.color}18`,color:pool.color,borderRadius:4,padding:"1px 6px"}}>{pool.label}</span>
-                            {tx.volumeUSD>0&&<span style={{fontSize:12,color:"#00d4aa",fontFamily:"'Space Grotesk',monospace",fontWeight:700}}>{fmtUSD(tx.volumeUSD)}</span>}
-                            {sp>0&&<span style={{fontSize:11,color:"#f59e0b",fontFamily:"'Space Grotesk',monospace"}}>+{sp} SP</span>}
-                          </div>
-                          <div style={{fontSize:11,color:"#4a5568",marginTop:3,display:"flex",gap:8,flexWrap:"wrap"}}>
-                            <span>{fmtDate(tx.timeStamp)}</span>
-                            <span>·</span>
-                            <a href={`https://sepolia.etherscan.io/tx/${tx.hash}`} target="_blank" rel="noreferrer" style={{color:"#2d3748",textDecoration:"none"}}>
-                              {tx.hash.slice(0,10)}...{tx.hash.slice(-6)} ↗
-                            </a>
-                          </div>
-                        </div>
-
-                        <div style={{fontSize:11,color:tx.isError==="1"?"#ef4444":"#22c55e",flexShrink:0,fontWeight:700}}>
-                          {tx.isError==="1"?"Failed":"✓"}
-                        </div>
-                      </div>
-                    );
-                  })
-                }
-              </div>
-            </div>
-          </div>
-        </>}
-
-        {/* Empty state */}
-        {!loading&&!done&&(
-          <div style={{textAlign:"center",padding:"80px 20px",color:"#4a5568",lineHeight:2.4}}>
-            <div style={{fontSize:52,marginBottom:16}}>🔍</div>
-            <div style={{fontSize:16,fontWeight:700,color:"#718096",marginBottom:8}}>Track any Stabilizer wallet</div>
-            <div style={{fontSize:13}}>
-              Enter a Sepolia wallet address to see<br/>
-              swap count · volume · SP score<br/>
-              daily/weekly/monthly activity
-            </div>
-          </div>
-        )}
-
-        <div style={{fontSize:11,color:"#2d3748",textAlign:"center",lineHeight:1.8}}>
-          Stabilizer Protocol · Sepolia Testnet · Live on-chain data
-          <br/><span style={{color:"#00d4aa33"}}>stabilizer.fi</span>
+        <div style={{marginTop:24,fontSize:11,color:"#2d3748",textAlign:"center",lineHeight:1.8}}>
+          Stabilizer Protocol · Sepolia Testnet · Live on-chain data · <span style={{color:"#00d4aa44"}}>stabilizer.fi</span>
         </div>
       </div>
     </div>
