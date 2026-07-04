@@ -1,0 +1,18 @@
+export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET");
+
+  const { address, action, offset = 10000 } = req.query;
+  const API_KEY = "KA6YTCMDKVQRNVDEQ75SV6SQ3SQSJN5Y6V";
+
+  // Etherscan API V2 endpoint with chainid=11155111 for Sepolia
+  const url = `https://api.etherscan.io/v2/api?chainid=11155111&module=account&action=${action || "txlist"}&address=${address}&startblock=0&endblock=99999999&page=1&offset=${offset}&sort=desc&apikey=${API_KEY}`;
+
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    res.status(200).json(data);
+  } catch (err) {
+    res.status(500).json({ status: "0", message: err.message, result: [] });
+  }
+}
