@@ -28,18 +28,52 @@ const TIERS = [
 ];
 function getTier(sp) { return TIERS.find(t => sp >= t.minSP) || TIERS[TIERS.length-1]; }
 
-// Classify tx - swap goes to router, claim/deposit go to pool
+// ── THEME ──────────────────────────────────────────────────
+const DARK = {
+  bg:       "linear-gradient(160deg,#060b18 0%,#080d1a 50%,#06101f 100%)",
+  card:     "#0d1525",
+  card2:    "#0a0f1e",
+  input:    "#060b18",
+  border:   "#1e293b",
+  border2:  "#2d3748",
+  text:     "#e2e8f0",
+  muted:    "#4a5568",
+  sub:      "#718096",
+  header:   "#0a1628",
+  tabBg:    "#0a0f1e",
+  rowAlt:   "#060b1844",
+  tblHead:  "#060b18",
+};
+const LIGHT = {
+  bg:       "linear-gradient(160deg,#f0f4f8 0%,#e8eef5 50%,#edf2f7 100%)",
+  card:     "#ffffff",
+  card2:    "#f7fafc",
+  input:    "#ffffff",
+  border:   "#e2e8f0",
+  border2:  "#cbd5e0",
+  text:     "#1a202c",
+  muted:    "#718096",
+  sub:      "#4a5568",
+  header:   "#ffffff",
+  tabBg:    "#f7fafc",
+  rowAlt:   "#f7fafc",
+  tblHead:  "#edf2f7",
+};
+
+// Classify tx - swap goes to router, claim/deposit/withdraw go to pool
 function getTxType(tx) {
   const to  = tx.to?.toLowerCase() || "";
   const mid = (tx.methodId || tx.input?.slice(0,10) || "").toLowerCase();
 
   if (to === ROUTER_ADDR) return "swap";
 
-  const claimMethods = new Set(["0x349d8b48","0x0a7c4960","0x9163cd89","0x82013098","0xb78f8012","0x0a7c4960"]);
-  if (claimMethods.has(mid)) return "claim";
+  const claimMethods  = new Set(["0x349d8b48","0x0a7c4960","0x9163cd89","0x82013098","0xb78f8012"]);
+  const depositMethods= new Set(["0x68ffa1a8","0xe8eda9df","0xb6b55f25","0x6bf08450"]);
+  const withdrawMethods=new Set(["0x46f66e42","0x69328dec","0x2e1a7d4d","0x441a3e70"]);
 
-  const depositMethods = new Set(["0x68ffa1a8","0x46f66e42","0xe8eda9df","0xb6b55f25","0x6bf08450"]);
-  if (depositMethods.has(mid) && POOL_ADDRS.has(to)) return "deposit";
+  if (claimMethods.has(mid))   return "claim";
+  if (depositMethods.has(mid) && POOL_ADDRS.has(to))  return "deposit";
+  if (withdrawMethods.has(mid) && POOL_ADDRS.has(to)) return "withdraw";
 
   return null;
 }
@@ -169,64 +203,75 @@ async function getWalletData(walletAddr) {
   return results.sort((a,b) => parseInt(b.timeStamp) - parseInt(a.timeStamp));
 }
 
-// Leaderboard: fetch router txs to get all swappers
+// Leaderboard: fetch router txs (swaps) + pool txs (deposits/withdrawals/claims)
 async function buildLeaderboard() {
   const wallets = {};
+  const init = (addr, from) => {
+    if (!wallets[addr]) wallets[addr] = { address: from, swaps:0, deposits:0, withdrawals:0, claims:0, swapVolumeUSD:0, liqVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
+  };
+  const stamp = (w, ts) => { if (ts > w.lastSeen) w.lastSeen=ts; if (ts < w.firstSeen) w.firstSeen=ts; };
 
-  // Fetch latest txs from router (main swap contract)
-  const routerTxs = await apiGet(ROUTER_ADDR, "txlist", 2000, 1);
-  // Also fetch from pool contracts for deposits/claims
-  const poolTxsArr = await Promise.all(
-    Object.values(POOLS).map(p => apiGet(p.address, "txlist", 500, 1))
-  );
+  // Fetch router txs (swaps) + pool txs (deposits/withdrawals/claims) in parallel
+  const [routerTxs, poolTxsArr] = await Promise.all([
+    apiGet(ROUTER_ADDR, "txlist", 2000, 1),
+    Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "txlist", 1000, 1))),
+  ]);
   const allPoolTxs = poolTxsArr.flat();
 
-  // Process router txs (swaps)
   routerTxs.forEach(tx => {
     if (tx.isError === "1") return;
-    const addr = tx.from?.toLowerCase();
-    if (!addr) return;
-    if (!wallets[addr]) wallets[addr] = { address: tx.from, swaps:0, claims:0, swapVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
+    const addr = tx.from?.toLowerCase(); if (!addr) return;
+    init(addr, tx.from);
     wallets[addr].swaps++;
-    const ts = parseInt(tx.timeStamp);
-    if (ts > wallets[addr].lastSeen)  wallets[addr].lastSeen  = ts;
-    if (ts < wallets[addr].firstSeen) wallets[addr].firstSeen = ts;
+    stamp(wallets[addr], parseInt(tx.timeStamp));
   });
 
-  // Process pool txs (claims)
   allPoolTxs.forEach(tx => {
     if (tx.isError === "1") return;
-    const mid = (tx.methodId || "").toLowerCase();
-    const claimMethods = new Set(["0x349d8b48","0x0a7c4960","0x9163cd89"]);
-    if (!claimMethods.has(mid)) return;
-    const addr = tx.from?.toLowerCase();
-    if (!addr) return;
-    if (!wallets[addr]) wallets[addr] = { address: tx.from, swaps:0, claims:0, swapVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
-    wallets[addr].claims++;
-    const ts = parseInt(tx.timeStamp);
-    if (ts > wallets[addr].lastSeen) wallets[addr].lastSeen = ts;
-    if (ts < wallets[addr].firstSeen) wallets[addr].firstSeen = ts;
+    const mid  = (tx.methodId || "").toLowerCase();
+    const addr = tx.from?.toLowerCase(); if (!addr) return;
+    const type = getTxType(tx);
+    if (!type || type === "swap") return;
+    init(addr, tx.from);
+    if (type === "deposit")  wallets[addr].deposits++;
+    if (type === "withdraw") wallets[addr].withdrawals++;
+    if (type === "claim")    wallets[addr].claims++;
+    stamp(wallets[addr], parseInt(tx.timeStamp));
   });
 
-  // Get token transfers for router to calculate volumes
-  const routerTokenTxs = await apiGet(ROUTER_ADDR, "tokentx", 5000, 1);
+  // Token transfers for volume
+  const [routerTokenTxs, poolTokenTxsArr] = await Promise.all([
+    apiGet(ROUTER_ADDR, "tokentx", 5000, 1),
+    Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "tokentx", 1000, 1))),
+  ]);
+  const allPoolTokenTxs = poolTokenTxsArr.flat();
+
+  // Swap volume: tokens sent FROM wallet TO router
   routerTokenTxs.forEach(t => {
     const from = t.from?.toLowerCase();
     const to   = t.to?.toLowerCase();
-    if (to !== ROUTER_ADDR) return;
-    if (!wallets[from]) return;
+    if (to !== ROUTER_ADDR || !wallets[from]) return;
     const dec = parseInt(t.tokenDecimal) || 6;
-    const amount = parseFloat(t.value) / Math.pow(10, dec);
-    wallets[from].swapVolumeUSD += Math.min(amount, 1_000_000_000);
+    wallets[from].swapVolumeUSD += Math.min(parseFloat(t.value) / Math.pow(10, dec), 1_000_000_000);
+  });
+
+  // Liquidity volume: tokens sent FROM wallet TO pool contracts
+  allPoolTokenTxs.forEach(t => {
+    const from = t.from?.toLowerCase();
+    const to   = t.to?.toLowerCase();
+    if (!POOL_ADDRS.has(to) || !wallets[from]) return;
+    const dec = parseInt(t.tokenDecimal) || 6;
+    wallets[from].liqVolumeUSD += Math.min(parseFloat(t.value) / Math.pow(10, dec), 1_000_000_000);
   });
 
   return Object.values(wallets)
     .map(w => ({
       ...w,
-      sp: calcSP(w.swapVolumeUSD),
+      sp: calcSP(w.swapVolumeUSD + w.liqVolumeUSD),
+      totalVolumeUSD: w.swapVolumeUSD + w.liqVolumeUSD,
       daysActive: w.firstSeen < Infinity ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - w.firstSeen) / 86400)) : 1,
     }))
-    .sort((a,b) => b.sp - a.sp || b.swapVolumeUSD - a.swapVolumeUSD)
+    .sort((a,b) => b.sp - a.sp || b.totalVolumeUSD - a.totalVolumeUSD)
     .slice(0, 10000);
 }
 
@@ -244,12 +289,13 @@ function TierBadge({ sp }) {
   const t = getTier(sp);
   return <span style={{fontSize:11,background:`${t.color}18`,border:`1px solid ${t.color}44`,color:t.color,borderRadius:6,padding:"2px 8px",fontWeight:700,whiteSpace:"nowrap"}}>{t.icon} {t.name}</span>;
 }
-function StatBox({ label, value, color, sub }) {
+function StatBox({ label, value, color, sub, theme }) {
+  const T = theme || DARK;
   return (
-    <div style={{background:"#0a0f1e",border:`1px solid ${color}33`,borderRadius:12,padding:"14px 16px"}}>
-      <div style={{fontSize:10,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}}>{label}</div>
+    <div style={{background:T.card2,border:`1px solid ${color}33`,borderRadius:12,padding:"14px 16px"}}>
+      <div style={{fontSize:10,color:T.muted,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:6}}>{label}</div>
       <div style={{fontSize:20,fontWeight:800,color,fontFamily:"'Space Grotesk',monospace",letterSpacing:"-0.02em"}}>{value}</div>
-      {sub&&<div style={{fontSize:11,color:"#4a5568",marginTop:3}}>{sub}</div>}
+      {sub&&<div style={{fontSize:11,color:T.muted,marginTop:3}}>{sub}</div>}
     </div>
   );
 }
@@ -307,9 +353,10 @@ function LeaderRow({ lp, rank, isMobile, expanded, onToggle, onView }) {
         </div>
         {!isMobile&&<>
           <div style={{textAlign:"right",minWidth:90}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>⭐ SP</div><div style={{fontSize:15,fontWeight:800,color:"#f59e0b",fontFamily:"'Space Grotesk',monospace"}}>{lp.sp.toLocaleString()}</div></div>
-          <div style={{textAlign:"right",minWidth:100}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>💰 Swap Vol</div><div style={{fontSize:15,fontWeight:800,color:"#00d4aa",fontFamily:"'Space Grotesk',monospace"}}>{fmtUSD(lp.swapVolumeUSD)}</div></div>
-          <div style={{textAlign:"right",minWidth:60}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>⇄ Swaps</div><div style={{fontSize:15,fontWeight:800,color:"#e2e8f0",fontFamily:"'Space Grotesk',monospace"}}>{lp.swaps}</div></div>
-          <div style={{textAlign:"right",minWidth:55}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>Days</div><div style={{fontSize:15,fontWeight:800,color:"#718096",fontFamily:"'Space Grotesk',monospace"}}>{lp.daysActive}</div></div>
+          <div style={{textAlign:"right",minWidth:100}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>💰 Total Vol</div><div style={{fontSize:15,fontWeight:800,color:"#00d4aa",fontFamily:"'Space Grotesk',monospace"}}>{fmtUSD(lp.totalVolumeUSD||lp.swapVolumeUSD)}</div></div>
+          <div style={{textAlign:"right",minWidth:55}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>⇄ Swaps</div><div style={{fontSize:14,fontWeight:800,color:"#e2e8f0",fontFamily:"'Space Grotesk',monospace"}}>{lp.swaps}</div></div>
+          <div style={{textAlign:"right",minWidth:55}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>+ Liq</div><div style={{fontSize:14,fontWeight:800,color:"#00d4aa",fontFamily:"'Space Grotesk',monospace"}}>{lp.deposits||0}</div></div>
+          <div style={{textAlign:"right",minWidth:55}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>− Liq</div><div style={{fontSize:14,fontWeight:800,color:"#ef4444",fontFamily:"'Space Grotesk',monospace"}}>{lp.withdrawals||0}</div></div>
           <div style={{textAlign:"right",minWidth:85}}><div style={{fontSize:10,color:"#4a5568",marginBottom:2}}>Last Seen</div><div style={{fontSize:12,fontWeight:700,color:"#e2e8f0"}}>{lp.lastSeen?timeAgo(lp.lastSeen):"—"}</div></div>
         </>}
         {isMobile&&<div style={{textAlign:"right",flexShrink:0}}><div style={{fontSize:13,fontWeight:800,color:"#f59e0b",fontFamily:"'Space Grotesk',monospace"}}>{lp.sp.toLocaleString()} SP</div><div style={{fontSize:11,color:"#00d4aa"}}>{fmtUSD(lp.swapVolumeUSD)}</div></div>}
@@ -319,12 +366,16 @@ function LeaderRow({ lp, rank, isMobile, expanded, onToggle, onView }) {
         <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid #1e293b"}}>
           <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:8,marginBottom:10}}>
             {[
-              {l:"SP Score",     v:`${lp.sp.toLocaleString()} SP`, c:"#f59e0b"},
-              {l:"Swap Volume",  v:fmtUSD(lp.swapVolumeUSD),       c:"#00d4aa"},
-              {l:"Swaps",        v:lp.swaps,                        c:"#e2e8f0"},
-              {l:"Claims",       v:lp.claims,                       c:"#8b5cf6"},
-              {l:"Days Active",  v:lp.daysActive,                   c:"#718096"},
-              {l:"Last Seen",    v:lp.lastSeen?timeAgo(lp.lastSeen):"—", c:"#718096"},
+              {l:"SP Score",       v:`${lp.sp.toLocaleString()} SP`,      c:"#f59e0b"},
+              {l:"Total Volume",   v:fmtUSD(lp.totalVolumeUSD||lp.swapVolumeUSD), c:"#00d4aa"},
+              {l:"Swap Volume",    v:fmtUSD(lp.swapVolumeUSD),             c:"#00d4aa"},
+              {l:"Liq Volume",     v:fmtUSD(lp.liqVolumeUSD||0),           c:"#8b5cf6"},
+              {l:"Swaps",          v:lp.swaps,                             c:"#e2e8f0"},
+              {l:"Add Liquidity",  v:lp.deposits||0,                       c:"#00d4aa"},
+              {l:"Remove Liq",     v:lp.withdrawals||0,                    c:"#ef4444"},
+              {l:"Claims",         v:lp.claims||0,                         c:"#8b5cf6"},
+              {l:"Days Active",    v:lp.daysActive,                        c:"#718096"},
+              {l:"Last Seen",      v:lp.lastSeen?timeAgo(lp.lastSeen):"—", c:"#718096"},
             ].map(s=>(
               <div key={s.l} style={{background:`${s.c}10`,border:`1px solid ${s.c}22`,borderRadius:8,padding:"8px 10px"}}>
                 <div style={{fontSize:10,color:"#4a5568"}}>{s.l}</div>
@@ -343,7 +394,8 @@ function LeaderRow({ lp, rank, isMobile, expanded, onToggle, onView }) {
 }
 
 // ── ACTIVITY TRACKER ───────────────────────────────────────
-function ActivityTracker({ isMobile, jumpWallet }) {
+function ActivityTracker({ isMobile, jumpWallet, board, T }) {
+  T = T || DARK;
   const [input,   setInput]   = useState("");
   const [wallet,  setWallet]  = useState(jumpWallet||"");
   const [events,  setEvents]  = useState([]);
@@ -380,6 +432,13 @@ function ActivityTracker({ isMobile, jumpWallet }) {
   const daysActive   = firstSeen?Math.max(1,Math.ceil((Math.floor(Date.now()/1000)-parseInt(firstSeen))/86400)):0;
   const tier         = getTier(totalSP);
 
+  // Find leaderboard rank for this wallet
+  const lbRank = useMemo(()=>{
+    if (!board?.length || !wallet) return null;
+    const idx = board.findIndex(w => w.address.toLowerCase() === wallet.toLowerCase());
+    return idx >= 0 ? idx + 1 : null;
+  },[board, wallet]);
+
   const periodStats = useMemo(()=>{
     const s={swaps:0,vol:0,claims:0};
     chartEvts.forEach(e=>{
@@ -389,24 +448,24 @@ function ActivityTracker({ isMobile, jumpWallet }) {
     return s;
   },[chartEvts]);
 
-  const sec={background:"#0d1525",border:"1px solid #1e293b",borderRadius:14,padding:isMobile?14:20};
+  const sec={background:T.card,border:`1px solid ${T.border}`,borderRadius:14,padding:isMobile?14:20};
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:18}}>
       {/* Search */}
       <div style={sec}>
-        <div style={{fontSize:12,color:"#4a5568",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12}}>🔍 Wallet Activity Tracker</div>
+        <div style={{fontSize:12,color:T.muted,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12}}>🔍 Wallet Activity Tracker</div>
         <div style={{display:"flex",gap:10}}>
           <input type="text" placeholder="Enter Sepolia wallet address (0x...)"
             value={input} onChange={e=>setInput(e.target.value)}
             onKeyDown={e=>e.key==="Enter"&&runSearch(input)}
-            style={{flex:1,background:"#060b18",border:"1.5px solid #2d3748",color:"#e2e8f0",borderRadius:10,padding:"12px 16px",fontSize:15,fontFamily:"'Space Grotesk',monospace"}}
+            style={{flex:1,background:T.input,border:`1.5px solid ${T.border2}`,color:T.text,borderRadius:10,padding:"12px 16px",fontSize:15,fontFamily:"'Space Grotesk',monospace"}}
           />
           <button onClick={()=>runSearch(input)} disabled={loading} style={{background:"linear-gradient(135deg,#00d4aa,#0088ff)",border:"none",borderRadius:10,padding:"0 22px",color:"#060b18",fontWeight:800,fontSize:14,cursor:"pointer",opacity:loading?0.7:1,minWidth:90}}>
             {loading?"...":"Search"}
           </button>
         </div>
-        <div style={{fontSize:11,color:"#4a5568",marginTop:8}}>Tracks Swaps & Claim Fee transactions · Router + T/C/S/P-Pool on Sepolia</div>
+        <div style={{fontSize:11,color:T.muted,marginTop:8}}>Tracks Swaps & Claim Fee transactions · Router + T/C/S/P-Pool on Sepolia</div>
       </div>
 
       {loading&&<Spinner text="Fetching all transactions from Sepolia... this may take a moment"/>}
@@ -414,14 +473,26 @@ function ActivityTracker({ isMobile, jumpWallet }) {
 
       {!loading&&done&&events.length>0&&<>
         {/* Hero card */}
-        <div style={{background:`linear-gradient(135deg,${tier.color}12,#0d1525)`,border:`2px solid ${tier.color}44`,borderRadius:18,padding:isMobile?18:28}}>
+        <div style={{background:`linear-gradient(135deg,${tier.color}12,${T.card})`,border:`2px solid ${tier.color}44`,borderRadius:18,padding:isMobile?18:28}}>
           <div style={{display:"flex",alignItems:"flex-start",gap:14,marginBottom:20,flexWrap:"wrap"}}>
-            <div style={{width:52,height:52,borderRadius:"50%",background:`linear-gradient(135deg,${tier.color},#1e293b)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,fontWeight:800,color:"#060b18",flexShrink:0}}>{wallet[2]?.toUpperCase()}</div>
+            <div style={{position:"relative",flexShrink:0}}>
+              <div style={{width:52,height:52,borderRadius:"50%",background:`linear-gradient(135deg,${tier.color},#1e293b)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,fontWeight:800,color:"#060b18"}}>{wallet[2]?.toUpperCase()}</div>
+              {lbRank&&(
+                <div style={{position:"absolute",bottom:-6,right:-6,background:"#f59e0b",borderRadius:"50%",width:22,height:22,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:800,color:"#060b18",border:`2px solid ${T.card}`}}>
+                  #{lbRank}
+                </div>
+              )}
+            </div>
             <div style={{flex:1,minWidth:180}}>
-              <div style={{fontSize:15,fontWeight:700,color:"#e2e8f0",fontFamily:"'Space Grotesk',monospace",marginBottom:6}}>{shortAddr(wallet)}</div>
+              <div style={{fontSize:15,fontWeight:700,color:T.text,fontFamily:"'Space Grotesk',monospace",marginBottom:6}}>{shortAddr(wallet)}</div>
               <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
                 <TierBadge sp={totalSP}/>
-                <span style={{fontSize:12,color:"#4a5568"}}>{daysActive} days active</span>
+                {lbRank&&(
+                  <span style={{fontSize:12,background:"#f59e0b18",border:"1px solid #f59e0b44",color:"#f59e0b",borderRadius:6,padding:"2px 8px",fontWeight:700}}>
+                    🏆 Rank #{lbRank}
+                  </span>
+                )}
+                <span style={{fontSize:12,color:T.muted}}>{daysActive} days active</span>
                 {lastSeen&&<span style={{fontSize:12,color:"#00d4aa",fontWeight:600}}>Last seen: {timeAgo(lastSeen)}</span>}
               </div>
             </div>
@@ -534,6 +605,9 @@ export default function App() {
   const [updated,   setUpdated]   = useState(null);
   const [showAll,   setShowAll]   = useState(false);
   const [jumpWallet,setJumpWallet]= useState(null);
+  const [darkMode,  setDarkMode]  = useState(true);
+
+  const T = darkMode ? DARK : LIGHT;
 
   const loadBoard = useCallback(async()=>{
     setLoading(true);
@@ -553,48 +627,60 @@ export default function App() {
 
   const displayed=showAll?sorted:sorted.slice(0,25);
   const totalSP  =board.reduce((s,w)=>s+w.sp,0);
-  const totalVol =board.reduce((s,w)=>s+w.swapVolumeUSD,0);
-  const sec={background:"#0d1525",border:"1px solid #1e293b",borderRadius:14,padding:16};
+  const totalVol =board.reduce((s,w)=>s+(w.totalVolumeUSD||w.swapVolumeUSD),0);
+  const sec={background:T.card,border:`1px solid ${T.border}`,borderRadius:14,padding:16};
 
   return (
-    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#060b18 0%,#080d1a 50%,#06101f 100%)",fontFamily:"'Inter','Segoe UI',sans-serif",color:"#e2e8f0"}}>
+    <div style={{minHeight:"100vh",background:T.bg,fontFamily:"'Inter','Segoe UI',sans-serif",color:T.text,transition:"background 0.3s,color 0.3s"}}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700;800&family=Inter:wght@400;500;600&display=swap');
         *{box-sizing:border-box;} input:focus{outline:none;border-color:#00d4aa!important;box-shadow:0 0 0 2px rgba(0,212,170,0.15);}
         button{font-family:inherit;} a{color:inherit;}
-        ::-webkit-scrollbar{width:4px;} ::-webkit-scrollbar-track{background:#0d1525;} ::-webkit-scrollbar-thumb{background:#2d3748;border-radius:2px;}
+        ::-webkit-scrollbar{width:4px;} ::-webkit-scrollbar-track{background:${T.card};} ::-webkit-scrollbar-thumb{background:${T.border2};border-radius:2px;}
       `}</style>
 
       {/* Header */}
-      <div style={{background:"linear-gradient(180deg,#0a1628 0%,transparent 100%)",borderBottom:"1px solid #1e293b",padding:isMobile?"14px 16px":"18px 24px",position:"sticky",top:0,zIndex:50,backdropFilter:"blur(12px)"}}>
+      <div style={{background:darkMode?"linear-gradient(180deg,#0a1628 0%,transparent 100%)":T.header,borderBottom:`1px solid ${T.border}`,padding:isMobile?"14px 16px":"18px 24px",position:"sticky",top:0,zIndex:50,backdropFilter:"blur(12px)"}}>
         <div style={{maxWidth:960,margin:"0 auto",display:"flex",alignItems:"center",gap:12}}>
           <div style={{width:38,height:38,borderRadius:10,flexShrink:0,background:"linear-gradient(135deg,#00d4aa,#0088ff)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#060b18"}}>S</div>
           <div>
-            <div style={{fontSize:10,color:"#4a5568",letterSpacing:"0.1em",textTransform:"uppercase"}}>Stabilizer Protocol · Sepolia Testnet</div>
-            <div style={{fontSize:isMobile?16:20,fontWeight:800,color:"#f0f4f8",fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"-0.02em"}}>{tab==="leaderboard"?"SP Leaderboard":"Activity Tracker"}</div>
+            <div style={{fontSize:10,color:T.muted,letterSpacing:"0.1em",textTransform:"uppercase"}}>Stabilizer Protocol · Sepolia Testnet</div>
+            <div style={{fontSize:isMobile?16:20,fontWeight:800,color:T.text,fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"-0.02em"}}>{tab==="leaderboard"?"SP Leaderboard":"Activity Tracker"}</div>
           </div>
-          <div style={{marginLeft:"auto",display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
-            {updated&&<div style={{fontSize:10,color:"#00d4aa"}}>Live · {updated.toLocaleTimeString()}</div>}
-            <button onClick={loadBoard} disabled={loading} style={{background:"#0d1525",border:"1px solid #2d3748",color:"#718096",borderRadius:6,padding:"4px 10px",fontSize:11,cursor:"pointer"}}>{loading?"Loading...":"↻ Refresh"}</button>
+          <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
+            {/* Dark/Light toggle */}
+            <button onClick={()=>setDarkMode(v=>!v)} style={{
+              background:darkMode?"#1e293b":"#e2e8f0",
+              border:`1px solid ${T.border2}`,
+              borderRadius:20,padding:"6px 12px",cursor:"pointer",
+              fontSize:14,display:"flex",alignItems:"center",gap:6,
+              color:T.text,transition:"all 0.3s"
+            }}>
+              {darkMode?"☀️ Light":"🌙 Dark"}
+            </button>
+            <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+              {updated&&<div style={{fontSize:10,color:"#00d4aa"}}>Live · {updated.toLocaleTimeString()}</div>}
+              <button onClick={loadBoard} disabled={loading} style={{background:T.card,border:`1px solid ${T.border2}`,color:T.sub,borderRadius:6,padding:"4px 10px",fontSize:11,cursor:"pointer"}}>{loading?"Loading...":"↻ Refresh"}</button>
+            </div>
           </div>
         </div>
       </div>
 
       {/* Tabs */}
-      <div style={{borderBottom:"1px solid #1e293b",background:"#0a0f1e",position:"sticky",top:isMobile?62:70,zIndex:40}}>
+      <div style={{borderBottom:`1px solid ${T.border}`,background:T.tabBg,position:"sticky",top:isMobile?62:70,zIndex:40}}>
         <div style={{maxWidth:960,margin:"0 auto",display:"flex"}}>
           {[{k:"leaderboard",l:"🏆 SP Leaderboard"},{k:"activity",l:"📊 Activity Tracker"}].map(t=>(
-            <button key={t.k} onClick={()=>setTab(t.k)} style={{flex:1,padding:"11px",border:"none",cursor:"pointer",background:"none",fontSize:13,fontWeight:600,color:tab===t.k?"#00d4aa":"#4a5568",borderBottom:`2px solid ${tab===t.k?"#00d4aa":"transparent"}`,transition:"all 0.2s"}}>{t.l}</button>
+            <button key={t.k} onClick={()=>setTab(t.k)} style={{flex:1,padding:"11px",border:"none",cursor:"pointer",background:"none",fontSize:13,fontWeight:600,color:tab===t.k?"#00d4aa":T.muted,borderBottom:`2px solid ${tab===t.k?"#00d4aa":"transparent"}`,transition:"all 0.2s"}}>{t.l}</button>
           ))}
         </div>
       </div>
 
       <div style={{maxWidth:960,margin:"0 auto",padding:isMobile?"14px":"20px"}}>
-        {tab==="activity"?<ActivityTracker isMobile={isMobile} jumpWallet={jumpWallet}/>:(<>
+        {tab==="activity"?<ActivityTracker isMobile={isMobile} jumpWallet={jumpWallet} board={board} T={T}/>:(<>
 
-          <div style={{background:"#f59e0b0d",border:"1px solid #f59e0b22",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:"#718096",display:"flex",alignItems:"center",gap:8}}>
+          <div style={{background:"#f59e0b0d",border:"1px solid #f59e0b22",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:T.sub,display:"flex",alignItems:"center",gap:8}}>
             <span style={{fontSize:16}}>⭐</span>
-            <span>SP Score = 1 point per $1,000 swap volume · Ranked by SP · Live from Sepolia Router</span>
+            <span>SP Score = 1 SP per $1,000 volume (swaps + liquidity) · Live from Sepolia</span>
           </div>
 
           {loading?<Spinner text="Fetching leaderboard from Sepolia..."/>:(<>
@@ -603,10 +689,10 @@ export default function App() {
                 {icon:"👛",label:"Active Wallets", value:board.length,             color:"#00d4aa"},
                 {icon:"⭐",label:"Total SP",        value:totalSP.toLocaleString(), color:"#f59e0b"},
                 {icon:"💰",label:"Total Volume",    value:fmtUSD(totalVol),          color:"#00d4aa"},
-                {icon:"⇄",label:"Total Swaps",    value:board.reduce((s,w)=>s+w.swaps,0), color:"#e2e8f0"},
+                {icon:"⇄",label:"Total Swaps",    value:board.reduce((s,w)=>s+w.swaps,0), color:T.text},
               ].map((s,i)=>(
-                <div key={i} style={{background:"#0d1525",border:"1px solid #1e293b",borderRadius:12,padding:"14px 16px"}}>
-                  <div style={{fontSize:11,color:"#4a5568",marginBottom:6}}>{s.icon} {s.label}</div>
+                <div key={i} style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:12,padding:"14px 16px"}}>
+                  <div style={{fontSize:11,color:T.muted,marginBottom:6}}>{s.icon} {s.label}</div>
                   <div style={{fontSize:isMobile?17:21,fontWeight:800,color:s.color,fontFamily:"'Space Grotesk',monospace"}}>{s.value}</div>
                 </div>
               ))}
@@ -614,39 +700,40 @@ export default function App() {
 
             {/* Tier filter */}
             <div style={{display:"flex",gap:8,marginBottom:14,flexWrap:"wrap"}}>
-              <button onClick={()=>setTierF("all")} style={{background:tierF==="all"?"#ffffff15":"transparent",border:`1px solid ${tierF==="all"?"#ffffff44":"#2d3748"}`,color:tierF==="all"?"#e2e8f0":"#4a5568",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>All Tiers</button>
+              <button onClick={()=>setTierF("all")} style={{background:tierF==="all"?`${T.border2}88`:"transparent",border:`1px solid ${tierF==="all"?T.text+"44":T.border2}`,color:tierF==="all"?T.text:T.muted,borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>All Tiers</button>
               {TIERS.map(t=>{
                 const cnt=board.filter(w=>{const nx=TIERS[TIERS.indexOf(t)-1];return w.sp>=t.minSP&&(!nx||w.sp<nx.minSP);}).length;
-                return <button key={t.name} onClick={()=>setTierF(tierF===t.name?"all":t.name)} style={{background:tierF===t.name?`${t.color}18`:"transparent",border:`1px solid ${tierF===t.name?t.color:"#2d3748"}`,color:tierF===t.name?t.color:"#4a5568",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>{t.icon} {t.name} <span style={{opacity:0.6}}>({cnt})</span></button>;
+                return <button key={t.name} onClick={()=>setTierF(tierF===t.name?"all":t.name)} style={{background:tierF===t.name?`${t.color}18`:"transparent",border:`1px solid ${tierF===t.name?t.color:T.border2}`,color:tierF===t.name?t.color:T.muted,borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>{t.icon} {t.name} <span style={{opacity:0.6}}>({cnt})</span></button>;
               })}
             </div>
 
             <div style={{...sec,marginBottom:14,display:"flex",flexDirection:"column",gap:12}}>
               <input type="text" placeholder="Search by wallet address..." value={search} onChange={e=>setSearch(e.target.value)}
-                style={{width:"100%",background:"#0a0f1e",border:"1px solid #2d3748",color:"#e2e8f0",borderRadius:10,padding:"10px 14px",fontSize:14,fontFamily:"'Space Grotesk',monospace"}}
+                style={{width:"100%",background:T.input,border:`1px solid ${T.border2}`,color:T.text,borderRadius:10,padding:"10px 14px",fontSize:14,fontFamily:"'Space Grotesk',monospace"}}
               />
               <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
                 {[{k:"sp",l:"⭐ SP Score"},{k:"swaps",l:"⇄ Swaps"},{k:"lastSeen",l:"🕒 Recent"}].map(o=>(
-                  <button key={o.k} onClick={()=>setSortBy(o.k)} style={{background:sortBy===o.k?"#00d4aa22":"transparent",border:`1.5px solid ${sortBy===o.k?"#00d4aa":"#2d3748"}`,color:sortBy===o.k?"#00d4aa":"#718096",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>{o.l}</button>
+                  <button key={o.k} onClick={()=>setSortBy(o.k)} style={{background:sortBy===o.k?"#00d4aa22":"transparent",border:`1.5px solid ${sortBy===o.k?"#00d4aa":T.border2}`,color:sortBy===o.k?"#00d4aa":T.sub,borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>{o.l}</button>
                 ))}
               </div>
             </div>
 
             {!isMobile&&(
-              <div style={{display:"flex",alignItems:"center",gap:14,padding:"0 18px 8px",fontSize:10,color:"#4a5568",letterSpacing:"0.08em",textTransform:"uppercase"}}>
+              <div style={{display:"flex",alignItems:"center",gap:14,padding:"0 18px 8px",fontSize:10,color:T.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>
                 <div style={{minWidth:32}}>Rank</div>
                 <div style={{flex:1}}>Wallet</div>
                 <div style={{minWidth:90,textAlign:"right"}}>⭐ SP</div>
-                <div style={{minWidth:100,textAlign:"right"}}>💰 Swap Vol</div>
-                <div style={{minWidth:60,textAlign:"right"}}>⇄ Swaps</div>
-                <div style={{minWidth:55,textAlign:"right"}}>Days</div>
+                <div style={{minWidth:100,textAlign:"right"}}>💰 Total Vol</div>
+                <div style={{minWidth:55,textAlign:"right"}}>⇄ Swaps</div>
+                <div style={{minWidth:55,textAlign:"right"}}>+ Liq</div>
+                <div style={{minWidth:55,textAlign:"right"}}>− Liq</div>
                 <div style={{minWidth:85,textAlign:"right"}}>Last Seen</div>
                 <div style={{minWidth:20}}></div>
               </div>
             )}
 
             {sorted.length===0
-              ?<div style={{textAlign:"center",padding:"40px",color:"#4a5568"}}>No wallets found.</div>
+              ?<div style={{textAlign:"center",padding:"40px",color:T.muted}}>No wallets found.</div>
               :displayed.map((lp,i)=>(
                 <LeaderRow key={lp.address} lp={lp} rank={i+1} isMobile={isMobile}
                   expanded={expanded===i} onToggle={()=>setExpanded(expanded===i?null:i)}
@@ -656,24 +743,24 @@ export default function App() {
             }
 
             {sorted.length>25&&(
-              <button onClick={()=>setShowAll(v=>!v)} style={{width:"100%",padding:"12px",background:"#0d1525",border:"1px solid #2d3748",color:"#718096",borderRadius:12,cursor:"pointer",fontSize:13,fontWeight:600,marginTop:4}}>
+              <button onClick={()=>setShowAll(v=>!v)} style={{width:"100%",padding:"12px",background:T.card,border:`1px solid ${T.border2}`,color:T.muted,borderRadius:12,cursor:"pointer",fontSize:13,fontWeight:600,marginTop:4}}>
                 {showAll?`Show less ▲`:`Show all ${sorted.length} wallets ▼`}
               </button>
             )}
 
-            <div style={{display:"flex",gap:12,flexWrap:"wrap",marginTop:16,paddingTop:16,borderTop:"1px solid #1e293b"}}>
+            <div style={{display:"flex",gap:12,flexWrap:"wrap",marginTop:16,paddingTop:16,borderTop:`1px solid ${T.border}`}}>
               {Object.entries(POOLS).map(([k,v])=>(
                 <div key={k} style={{display:"flex",alignItems:"center",gap:6}}>
                   <div style={{width:8,height:8,borderRadius:"50%",background:v.color}}/>
-                  <span style={{fontSize:11,color:"#4a5568"}}>{v.label} · {v.token}</span>
+                  <span style={{fontSize:11,color:T.muted}}>{v.label} · {v.token}</span>
                 </div>
               ))}
             </div>
           </>)}
         </>)}
 
-        <div style={{marginTop:24,fontSize:11,color:"#2d3748",textAlign:"center",lineHeight:1.8}}>
-          Stabilizer Protocol · Sepolia Testnet · Live on-chain data · <span style={{color:"#00d4aa44"}}>stabilizer.fi</span>
+        <div style={{marginTop:24,fontSize:11,color:T.muted,textAlign:"center",lineHeight:1.8}}>
+          Stabilizer Protocol · Sepolia Testnet · Live on-chain data · <span style={{color:"#00d4aa"}}>stabilizer.fi</span>
         </div>
       </div>
     </div>
