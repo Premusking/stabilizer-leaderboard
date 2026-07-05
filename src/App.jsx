@@ -203,7 +203,7 @@ async function getWalletData(walletAddr) {
   return results.sort((a,b) => parseInt(b.timeStamp) - parseInt(a.timeStamp));
 }
 
-// Leaderboard: fetch router txs (swaps) + pool txs (deposits/withdrawals/claims)
+// Leaderboard: ranked by liquidity added (deposits)
 async function buildLeaderboard() {
   const wallets = {};
   const init = (addr, from) => {
@@ -211,7 +211,7 @@ async function buildLeaderboard() {
   };
   const stamp = (w, ts) => { if (ts > w.lastSeen) w.lastSeen=ts; if (ts < w.firstSeen) w.firstSeen=ts; };
 
-  // Fetch router txs (swaps) + pool txs (deposits/withdrawals/claims) in parallel
+  // Fetch router txs (swaps) + pool txs in parallel
   const [routerTxs, poolTxsArr] = await Promise.all([
     apiGet(ROUTER_ADDR, "txlist", 2000, 1),
     Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "txlist", 1000, 1))),
@@ -228,7 +228,6 @@ async function buildLeaderboard() {
 
   allPoolTxs.forEach(tx => {
     if (tx.isError === "1") return;
-    const mid  = (tx.methodId || "").toLowerCase();
     const addr = tx.from?.toLowerCase(); if (!addr) return;
     const type = getTxType(tx);
     if (!type || type === "swap") return;
@@ -242,7 +241,7 @@ async function buildLeaderboard() {
   // Token transfers for volume
   const [routerTokenTxs, poolTokenTxsArr] = await Promise.all([
     apiGet(ROUTER_ADDR, "tokentx", 5000, 1),
-    Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "tokentx", 1000, 1))),
+    Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "tokentx", 2000, 1))),
   ]);
   const allPoolTokenTxs = poolTokenTxsArr.flat();
 
@@ -252,7 +251,9 @@ async function buildLeaderboard() {
     const to   = t.to?.toLowerCase();
     if (to !== ROUTER_ADDR || !wallets[from]) return;
     const dec = parseInt(t.tokenDecimal) || 6;
-    wallets[from].swapVolumeUSD += Math.min(parseFloat(t.value) / Math.pow(10, dec), 1_000_000_000);
+    const amt = parseFloat(t.value) / Math.pow(10, dec);
+    if (!isNaN(amt) && isFinite(amt) && amt > 0)
+      wallets[from].swapVolumeUSD += Math.min(amt, 1_000_000_000);
   });
 
   // Liquidity volume: tokens sent FROM wallet TO pool contracts
@@ -261,17 +262,20 @@ async function buildLeaderboard() {
     const to   = t.to?.toLowerCase();
     if (!POOL_ADDRS.has(to) || !wallets[from]) return;
     const dec = parseInt(t.tokenDecimal) || 6;
-    wallets[from].liqVolumeUSD += Math.min(parseFloat(t.value) / Math.pow(10, dec), 1_000_000_000);
+    const amt = parseFloat(t.value) / Math.pow(10, dec);
+    if (!isNaN(amt) && isFinite(amt) && amt > 0)
+      wallets[from].liqVolumeUSD += Math.min(amt, 1_000_000_000);
   });
 
   return Object.values(wallets)
     .map(w => ({
       ...w,
-      sp: calcSP(w.swapVolumeUSD + w.liqVolumeUSD),
       totalVolumeUSD: w.swapVolumeUSD + w.liqVolumeUSD,
+      sp: calcSP(w.swapVolumeUSD + w.liqVolumeUSD),
       daysActive: w.firstSeen < Infinity ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - w.firstSeen) / 86400)) : 1,
     }))
-    .sort((a,b) => b.sp - a.sp || b.totalVolumeUSD - a.totalVolumeUSD)
+    // Rank by liquidity added (deposits) then liqVolumeUSD as tiebreaker
+    .sort((a,b) => b.deposits - a.deposits || b.liqVolumeUSD - a.liqVolumeUSD)
     .slice(0, 10000);
 }
 
@@ -500,10 +504,16 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
           </div>
 
           <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:12,marginBottom:16}}>
-            <StatBox label="⭐ SP Score"    value={totalSP.toLocaleString()} color="#f59e0b" sub="1 SP per $1,000 vol"/>
-            <StatBox label="💰 Swap Volume" value={fmtUSD(totalVol)}         color="#00d4aa"/>
-            <StatBox label="⇄ Swaps"       value={swapCount}                 color="#e2e8f0"/>
-            <StatBox label="★ Claims"       value={claimCount}                color="#8b5cf6"/>
+            <StatBox label="⭐ SP Score"    value={totalSP.toLocaleString()} color="#f59e0b" sub="1 SP per $1,000 vol" theme={T}/>
+            <StatBox label="💰 Swap Volume" value={fmtUSD(totalVol)}         color="#00d4aa" theme={T}/>
+            <StatBox label="⇄ Swaps"       value={swapCount}                 color="#e2e8f0" theme={T}/>
+            <StatBox
+              label="🏆 Leaderboard Rank"
+              value={lbRank ? `#${lbRank}` : "—"}
+              color="#f59e0b"
+              sub={lbRank ? `Top ${((lbRank/Math.max(board?.length,1))*100).toFixed(1)}% of wallets` : "Not ranked yet"}
+              theme={T}
+            />
           </div>
         </div>
 
@@ -596,7 +606,7 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
 export default function App() {
   const isMobile    = useIsMobile();
   const [tab,       setTab]       = useState("leaderboard");
-  const [sortBy,    setSortBy]    = useState("sp");
+  const [sortBy,    setSortBy]    = useState("deposits");
   const [search,    setSearch]    = useState("");
   const [tierF,     setTierF]     = useState("all");
   const [expanded,  setExpanded]  = useState(null);
@@ -621,7 +631,7 @@ export default function App() {
     let d=[...board];
     if(tierF!=="all"){const t=TIERS.find(x=>x.name===tierF),nx=TIERS[TIERS.indexOf(t)-1];d=d.filter(w=>w.sp>=t.minSP&&(!nx||w.sp<nx.minSP));}
     if(search.trim()){const q=search.toLowerCase();d=d.filter(w=>w.address.toLowerCase().includes(q));}
-    d.sort((a,b)=>sortBy==="swaps"?b.swaps-a.swaps:sortBy==="lastSeen"?b.lastSeen-a.lastSeen:b.sp-a.sp);
+    d.sort((a,b)=>sortBy==="swaps"?b.swaps-a.swaps:sortBy==="lastSeen"?b.lastSeen-a.lastSeen:sortBy==="deposits"?b.deposits-a.deposits:b.sp-a.sp);
     return d;
   },[board,tierF,search,sortBy]);
 
@@ -680,7 +690,7 @@ export default function App() {
 
           <div style={{background:"#f59e0b0d",border:"1px solid #f59e0b22",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:T.sub,display:"flex",alignItems:"center",gap:8}}>
             <span style={{fontSize:16}}>⭐</span>
-            <span>SP Score = 1 SP per $1,000 volume (swaps + liquidity) · Live from Sepolia</span>
+            <span>Ranked by Liquidity Added · SP Score = 1 SP per $1,000 volume · Live from Sepolia</span>
           </div>
 
           {loading?<Spinner text="Fetching leaderboard from Sepolia..."/>:(<>
@@ -712,7 +722,7 @@ export default function App() {
                 style={{width:"100%",background:T.input,border:`1px solid ${T.border2}`,color:T.text,borderRadius:10,padding:"10px 14px",fontSize:14,fontFamily:"'Space Grotesk',monospace"}}
               />
               <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                {[{k:"sp",l:"⭐ SP Score"},{k:"swaps",l:"⇄ Swaps"},{k:"lastSeen",l:"🕒 Recent"}].map(o=>(
+                {[{k:"deposits",l:"+ Liq Added"},{k:"sp",l:"⭐ SP Score"},{k:"swaps",l:"⇄ Swaps"},{k:"lastSeen",l:"🕒 Recent"}].map(o=>(
                   <button key={o.k} onClick={()=>setSortBy(o.k)} style={{background:sortBy===o.k?"#00d4aa22":"transparent",border:`1.5px solid ${sortBy===o.k?"#00d4aa":T.border2}`,color:sortBy===o.k?"#00d4aa":T.sub,borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>{o.l}</button>
                 ))}
               </div>
