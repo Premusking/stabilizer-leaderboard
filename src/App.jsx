@@ -206,12 +206,19 @@ async function getWalletData(walletAddr) {
 // Leaderboard: ranked by liquidity added (deposits)
 async function buildLeaderboard() {
   const wallets = {};
+  const swapHashesByWallet = {}; // track which hashes belong to each wallet for volume dedup
+  const liqHashesByWallet  = {};
+
   const init = (addr, from) => {
-    if (!wallets[addr]) wallets[addr] = { address: from, swaps:0, deposits:0, withdrawals:0, claims:0, swapVolumeUSD:0, liqVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
+    if (!wallets[addr]) {
+      wallets[addr]          = { address: from, swaps:0, deposits:0, withdrawals:0, claims:0, swapVolumeUSD:0, liqVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
+      swapHashesByWallet[addr] = new Set();
+      liqHashesByWallet[addr]  = new Set();
+    }
   };
   const stamp = (w, ts) => { if (ts > w.lastSeen) w.lastSeen=ts; if (ts < w.firstSeen) w.firstSeen=ts; };
 
-  // Fetch router txs (swaps) + pool txs in parallel
+  // 1. Fetch tx lists
   const [routerTxs, poolTxsArr] = await Promise.all([
     apiGet(ROUTER_ADDR, "txlist", 2000, 1),
     Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "txlist", 1000, 1))),
@@ -223,6 +230,7 @@ async function buildLeaderboard() {
     const addr = tx.from?.toLowerCase(); if (!addr) return;
     init(addr, tx.from);
     wallets[addr].swaps++;
+    swapHashesByWallet[addr].add(tx.hash?.toLowerCase());
     stamp(wallets[addr], parseInt(tx.timeStamp));
   });
 
@@ -232,49 +240,72 @@ async function buildLeaderboard() {
     const type = getTxType(tx);
     if (!type || type === "swap") return;
     init(addr, tx.from);
-    if (type === "deposit")  wallets[addr].deposits++;
-    if (type === "withdraw") wallets[addr].withdrawals++;
-    if (type === "claim")    wallets[addr].claims++;
+    if (type === "deposit")  { wallets[addr].deposits++;  liqHashesByWallet[addr].add(tx.hash?.toLowerCase()); }
+    if (type === "withdraw") { wallets[addr].withdrawals++; }
+    if (type === "claim")    { wallets[addr].claims++; }
     stamp(wallets[addr], parseInt(tx.timeStamp));
   });
 
-  // Token transfers for volume
+  // 2. Token transfers for volume — deduplicate per tx hash per wallet
   const [routerTokenTxs, poolTokenTxsArr] = await Promise.all([
     apiGet(ROUTER_ADDR, "tokentx", 5000, 1),
     Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "tokentx", 2000, 1))),
   ]);
   const allPoolTokenTxs = poolTokenTxsArr.flat();
 
-  // Swap volume: tokens sent FROM wallet TO router
+  // Swap volume: first transfer FROM wallet TO router per tx hash
+  const countedSwapHashes = new Set();
   routerTokenTxs.forEach(t => {
     const from = t.from?.toLowerCase();
     const to   = t.to?.toLowerCase();
-    if (to !== ROUTER_ADDR || !wallets[from]) return;
+    const h    = t.hash?.toLowerCase();
+    if (to !== ROUTER_ADDR) return;
+    if (!wallets[from]) return;
+    if (!swapHashesByWallet[from]?.has(h)) return;
+    const key = `${from}:${h}`;
+    if (countedSwapHashes.has(key)) return; // only count once per tx per wallet
+    countedSwapHashes.add(key);
     const dec = parseInt(t.tokenDecimal) || 6;
     const amt = parseFloat(t.value) / Math.pow(10, dec);
-    if (!isNaN(amt) && isFinite(amt) && amt > 0)
-      wallets[from].swapVolumeUSD += Math.min(amt, 1_000_000_000);
+    if (!isNaN(amt) && isFinite(amt) && amt > 0 && amt < 1_000_000_000)
+      wallets[from].swapVolumeUSD += amt;
   });
 
-  // Liquidity volume: tokens sent FROM wallet TO pool contracts
+  // Liquidity volume: first transfer FROM wallet TO pool per tx hash
+  const countedLiqHashes = new Set();
   allPoolTokenTxs.forEach(t => {
     const from = t.from?.toLowerCase();
     const to   = t.to?.toLowerCase();
-    if (!POOL_ADDRS.has(to) || !wallets[from]) return;
+    const h    = t.hash?.toLowerCase();
+    if (!POOL_ADDRS.has(to)) return;
+    if (!wallets[from]) return;
+    if (!liqHashesByWallet[from]?.has(h)) return;
+    const key = `${from}:${h}`;
+    if (countedLiqHashes.has(key)) return;
+    countedLiqHashes.add(key);
     const dec = parseInt(t.tokenDecimal) || 6;
     const amt = parseFloat(t.value) / Math.pow(10, dec);
-    if (!isNaN(amt) && isFinite(amt) && amt > 0)
-      wallets[from].liqVolumeUSD += Math.min(amt, 1_000_000_000);
+    if (!isNaN(amt) && isFinite(amt) && amt > 0 && amt < 1_000_000_000)
+      wallets[from].liqVolumeUSD += amt;
   });
 
   return Object.values(wallets)
     .map(w => ({
-      ...w,
+      address:        w.address,
+      swaps:          w.swaps,
+      deposits:       w.deposits,
+      withdrawals:    w.withdrawals,
+      claims:         w.claims,
+      swapVolumeUSD:  w.swapVolumeUSD,
+      liqVolumeUSD:   w.liqVolumeUSD,
       totalVolumeUSD: w.swapVolumeUSD + w.liqVolumeUSD,
-      sp: calcSP(w.swapVolumeUSD + w.liqVolumeUSD),
-      daysActive: w.firstSeen < Infinity ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - w.firstSeen) / 86400)) : 1,
+      sp:             calcSP(w.swapVolumeUSD + w.liqVolumeUSD),
+      lastSeen:       w.lastSeen,
+      firstSeen:      w.firstSeen,
+      daysActive:     w.firstSeen < Infinity
+        ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - w.firstSeen) / 86400))
+        : 1,
     }))
-    // Rank by liquidity added (deposits) then liqVolumeUSD as tiebreaker
     .sort((a,b) => b.deposits - a.deposits || b.liqVolumeUSD - a.liqVolumeUSD)
     .slice(0, 10000);
 }
