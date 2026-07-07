@@ -16,8 +16,12 @@ const POOL_BY_ADDR = Object.fromEntries(Object.entries(POOLS).map(([k,v]) => [v.
 // All Stabilizer contracts (router + pools)
 const ALL_STABILIZER_ADDRS = new Set([ROUTER_ADDR, ...Object.values(POOLS).map(p => p.address.toLowerCase())]);
 
-// SP: 1 per $1000 volume
-function calcSP(vol) { return Math.floor(vol / 1000); }
+// SP Formula (official):
+// Swap: $1,000 volume = 10 SP  (vol / 100)
+// LP Deposit: $1,000 = 20 SP  (vol / 50)
+function calcSwapSP(vol) { return Math.floor(vol / 100); }
+function calcLiqSP(vol)  { return Math.floor(vol / 50); }
+function calcSP(swapVol, liqVol) { return calcSwapSP(swapVol) + calcLiqSP(liqVol); }
 
 // Tiers based on SP
 const TIERS = [
@@ -203,86 +207,122 @@ async function getWalletData(walletAddr) {
   return results.sort((a,b) => parseInt(b.timeStamp) - parseInt(a.timeStamp));
 }
 
-// Leaderboard: ranked by liquidity added (deposits)
+// Leaderboard — pulls ALL router txs (paginated) for accurate 15K+ wallet data
+// Ranked by: swap count → swap volume → SP
 async function buildLeaderboard() {
   const wallets = {};
-  const swapHashesByWallet = {}; // track which hashes belong to each wallet for volume dedup
-  const liqHashesByWallet  = {};
+  const swapHashes = {}; // wallet -> Set of swap tx hashes
+  const liqHashes  = {}; // wallet -> Set of liq tx hashes
 
   const init = (addr, from) => {
     if (!wallets[addr]) {
-      wallets[addr]          = { address: from, swaps:0, deposits:0, withdrawals:0, claims:0, swapVolumeUSD:0, liqVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
-      swapHashesByWallet[addr] = new Set();
-      liqHashesByWallet[addr]  = new Set();
+      wallets[addr]   = { address: from, swaps:0, deposits:0, withdrawals:0, claims:0, swapVolumeUSD:0, liqVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
+      swapHashes[addr] = new Set();
+      liqHashes[addr]  = new Set();
     }
   };
-  const stamp = (w, ts) => { if (ts > w.lastSeen) w.lastSeen=ts; if (ts < w.firstSeen) w.firstSeen=ts; };
+  const stamp = (w, ts) => {
+    if (ts > w.lastSeen)  w.lastSeen  = ts;
+    if (ts < w.firstSeen) w.firstSeen = ts;
+  };
 
-  // 1. Fetch tx lists
-  const [routerTxs, poolTxsArr] = await Promise.all([
-    apiGet(ROUTER_ADDR, "txlist", 2000, 1),
-    Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "txlist", 1000, 1))),
-  ]);
+  // 1. Fetch ALL router txs (paginated) — router has all swap interactions
+  const routerTxs = [];
+  for (let page = 1; page <= 15; page++) {
+    const batch = await apiGet(ROUTER_ADDR, "txlist", 10000, page);
+    if (!batch.length) break;
+    routerTxs.push(...batch);
+    if (batch.length < 10000) break;
+  }
+
+  // 2. Fetch pool txs (deposits/withdrawals/claims) — paginate top 3 pages
+  const poolTxsArr = await Promise.all(
+    Object.values(POOLS).map(async p => {
+      const all = [];
+      for (let page = 1; page <= 3; page++) {
+        const batch = await apiGet(p.address, "txlist", 10000, page);
+        if (!batch.length) break;
+        all.push(...batch);
+        if (batch.length < 10000) break;
+      }
+      return all;
+    })
+  );
   const allPoolTxs = poolTxsArr.flat();
 
+  // Process router txs — each is a swap
   routerTxs.forEach(tx => {
     if (tx.isError === "1") return;
     const addr = tx.from?.toLowerCase(); if (!addr) return;
     init(addr, tx.from);
     wallets[addr].swaps++;
-    swapHashesByWallet[addr].add(tx.hash?.toLowerCase());
+    swapHashes[addr].add(tx.hash?.toLowerCase());
     stamp(wallets[addr], parseInt(tx.timeStamp));
   });
 
+  // Process pool txs
   allPoolTxs.forEach(tx => {
     if (tx.isError === "1") return;
     const addr = tx.from?.toLowerCase(); if (!addr) return;
     const type = getTxType(tx);
     if (!type || type === "swap") return;
     init(addr, tx.from);
-    if (type === "deposit")  { wallets[addr].deposits++;  liqHashesByWallet[addr].add(tx.hash?.toLowerCase()); }
+    if (type === "deposit")  { wallets[addr].deposits++;  liqHashes[addr].add(tx.hash?.toLowerCase()); }
     if (type === "withdraw") { wallets[addr].withdrawals++; }
     if (type === "claim")    { wallets[addr].claims++; }
     stamp(wallets[addr], parseInt(tx.timeStamp));
   });
 
-  // 2. Token transfers for volume — deduplicate per tx hash per wallet
-  const [routerTokenTxs, poolTokenTxsArr] = await Promise.all([
-    apiGet(ROUTER_ADDR, "tokentx", 5000, 1),
-    Promise.all(Object.values(POOLS).map(p => apiGet(p.address, "tokentx", 2000, 1))),
-  ]);
-  const allPoolTokenTxs = poolTokenTxsArr.flat();
+  // 3. Router token transfers for swap volume — one transfer per tx per wallet
+  const routerTokenTxs = [];
+  for (let page = 1; page <= 5; page++) {
+    const batch = await apiGet(ROUTER_ADDR, "tokentx", 10000, page);
+    if (!batch.length) break;
+    routerTokenTxs.push(...batch);
+    if (batch.length < 10000) break;
+  }
 
-  // Swap volume: first transfer FROM wallet TO router per tx hash
-  const countedSwapHashes = new Set();
+  const countedSwap = new Set();
   routerTokenTxs.forEach(t => {
     const from = t.from?.toLowerCase();
     const to   = t.to?.toLowerCase();
     const h    = t.hash?.toLowerCase();
     if (to !== ROUTER_ADDR) return;
-    if (!wallets[from]) return;
-    if (!swapHashesByWallet[from]?.has(h)) return;
+    if (!wallets[from] || !swapHashes[from]?.has(h)) return;
     const key = `${from}:${h}`;
-    if (countedSwapHashes.has(key)) return; // only count once per tx per wallet
-    countedSwapHashes.add(key);
+    if (countedSwap.has(key)) return;
+    countedSwap.add(key);
     const dec = parseInt(t.tokenDecimal) || 6;
     const amt = parseFloat(t.value) / Math.pow(10, dec);
     if (!isNaN(amt) && isFinite(amt) && amt > 0 && amt < 1_000_000_000)
       wallets[from].swapVolumeUSD += amt;
   });
 
-  // Liquidity volume: first transfer FROM wallet TO pool per tx hash
-  const countedLiqHashes = new Set();
+  // 4. Pool token transfers for liquidity volume
+  const poolTokenTxsArr = await Promise.all(
+    Object.values(POOLS).map(async p => {
+      const all = [];
+      for (let page = 1; page <= 3; page++) {
+        const batch = await apiGet(p.address, "tokentx", 5000, page);
+        if (!batch.length) break;
+        all.push(...batch);
+        if (batch.length < 5000) break;
+      }
+      return all;
+    })
+  );
+  const allPoolTokenTxs = poolTokenTxsArr.flat();
+
+  const countedLiq = new Set();
   allPoolTokenTxs.forEach(t => {
     const from = t.from?.toLowerCase();
     const to   = t.to?.toLowerCase();
     const h    = t.hash?.toLowerCase();
     if (!POOL_ADDRS.has(to)) return;
-    if (!wallets[from]) return;
-    if (!liqHashesByWallet[from]?.has(h)) return;
+    if (!wallets[from] || !liqHashes[from]?.has(h)) return;
     const key = `${from}:${h}`;
-    if (countedLiqHashes.has(key)) return;
-    countedLiqHashes.add(key);
+    if (countedLiq.has(key)) return;
+    countedLiq.add(key);
     const dec = parseInt(t.tokenDecimal) || 6;
     const amt = parseFloat(t.value) / Math.pow(10, dec);
     if (!isNaN(amt) && isFinite(amt) && amt > 0 && amt < 1_000_000_000)
@@ -296,17 +336,18 @@ async function buildLeaderboard() {
       deposits:       w.deposits,
       withdrawals:    w.withdrawals,
       claims:         w.claims,
-      swapVolumeUSD:  w.swapVolumeUSD,
-      liqVolumeUSD:   w.liqVolumeUSD,
-      totalVolumeUSD: w.swapVolumeUSD + w.liqVolumeUSD,
-      sp:             calcSP(w.swapVolumeUSD + w.liqVolumeUSD),
+      swapVolumeUSD:  Math.round(w.swapVolumeUSD),
+      liqVolumeUSD:   Math.round(w.liqVolumeUSD),
+      totalVolumeUSD: Math.round(w.swapVolumeUSD + w.liqVolumeUSD),
+      sp:             calcSP(w.swapVolumeUSD, w.liqVolumeUSD),
       lastSeen:       w.lastSeen,
       firstSeen:      w.firstSeen,
       daysActive:     w.firstSeen < Infinity
         ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - w.firstSeen) / 86400))
         : 1,
     }))
-    .sort((a,b) => b.deposits - a.deposits || b.liqVolumeUSD - a.liqVolumeUSD)
+    // Rank by: swaps desc → swapVolumeUSD desc → sp desc
+    .sort((a,b) => b.swaps - a.swaps || b.swapVolumeUSD - a.swapVolumeUSD || b.sp - a.sp)
     .slice(0, 10000);
 }
 
@@ -459,7 +500,7 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
   const displayed = useMemo(()=>filter==="all"?events:events.filter(e=>e.txType===filter),[events,filter]);
 
   const totalVol     = events.filter(e=>e.txType==="swap").reduce((s,e)=>s+e.volumeUSD,0);
-  const totalSP      = calcSP(totalVol);
+  const totalSP      = calcSP(totalSwapVol, 0);
   const swapCount    = events.filter(e=>e.txType==="swap").length;
   const claimCount   = events.filter(e=>e.txType==="claim").length;
   const lastSeen     = events.length?events[0].timeStamp:null;
@@ -558,7 +599,7 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
                 <span style={{margin:"0 8px"}}>·</span>
                 <span style={{color:"#e2e8f0"}}>{periodStats.swaps} swaps</span>
                 <span style={{margin:"0 8px"}}>·</span>
-                <span style={{color:"#f59e0b"}}>+{calcSP(periodStats.vol)} SP earned</span>
+                <span style={{color:"#f59e0b"}}>+{calcSP(periodStats.vol, 0)} SP earned</span>
               </div>
             </div>
             <div style={{display:"flex",gap:6}}>
@@ -596,7 +637,7 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
                 const info = isSwap
                   ? {label:"Swap",color:"#f59e0b",icon:"⇄"}
                   : {label:"Claim Fees",color:"#8b5cf6",icon:"★"};
-                const sp = calcSP(tx.volumeUSD||0);
+                const sp = calcSP(tx.volumeUSD||0, 0);
                 return (
                   <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderBottom:"1px solid #0f1a2e",background:i%2===0?"transparent":"#060b1844"}}>
                     <div style={{width:36,height:36,borderRadius:8,flexShrink:0,background:`${info.color}15`,border:`1px solid ${info.color}33`,display:"flex",alignItems:"center",justifyContent:"center",color:info.color,fontSize:16,fontWeight:800}}>{info.icon}</div>
@@ -637,7 +678,7 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
 export default function App() {
   const isMobile    = useIsMobile();
   const [tab,       setTab]       = useState("leaderboard");
-  const [sortBy,    setSortBy]    = useState("deposits");
+  const [sortBy,    setSortBy]    = useState("swaps");
   const [search,    setSearch]    = useState("");
   const [tierF,     setTierF]     = useState("all");
   const [expanded,  setExpanded]  = useState(null);
@@ -662,7 +703,7 @@ export default function App() {
     let d=[...board];
     if(tierF!=="all"){const t=TIERS.find(x=>x.name===tierF),nx=TIERS[TIERS.indexOf(t)-1];d=d.filter(w=>w.sp>=t.minSP&&(!nx||w.sp<nx.minSP));}
     if(search.trim()){const q=search.toLowerCase();d=d.filter(w=>w.address.toLowerCase().includes(q));}
-    d.sort((a,b)=>sortBy==="swaps"?b.swaps-a.swaps:sortBy==="lastSeen"?b.lastSeen-a.lastSeen:sortBy==="deposits"?b.deposits-a.deposits:b.sp-a.sp);
+    d.sort((a,b)=>sortBy==="swaps"?b.swaps-a.swaps:sortBy==="lastSeen"?b.lastSeen-a.lastSeen:sortBy==="swapVolumeUSD"?b.swapVolumeUSD-a.swapVolumeUSD:b.sp-a.sp);
     return d;
   },[board,tierF,search,sortBy]);
 
@@ -721,14 +762,14 @@ export default function App() {
 
           <div style={{background:"#f59e0b0d",border:"1px solid #f59e0b22",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:T.sub,display:"flex",alignItems:"center",gap:8}}>
             <span style={{fontSize:16}}>⭐</span>
-            <span>Ranked by Liquidity Added · SP Score = 1 SP per $1,000 volume · Live from Sepolia</span>
+            <span>Ranked by Swaps · Swap $1,000 = 10 SP · LP Deposit $1,000 = 20 SP · Live from Sepolia</span>
           </div>
 
           {loading?<Spinner text="Fetching leaderboard from Sepolia..."/>:(<>
             <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:12,marginBottom:16}}>
               {[
                 {icon:"👛",label:"Active Wallets", value:board.length,             color:"#00d4aa"},
-                {icon:"⭐",label:"Total SP",        value:totalSP.toLocaleString(), color:"#f59e0b"},
+                {icon:"⭐",label:"Total SP",        value:board.reduce((s,w)=>s+w.sp,0).toLocaleString(), color:"#f59e0b"},
                 {icon:"💰",label:"Total Volume",    value:fmtUSD(totalVol),          color:"#00d4aa"},
                 {icon:"⇄",label:"Total Swaps",    value:board.reduce((s,w)=>s+w.swaps,0), color:T.text},
               ].map((s,i)=>(
@@ -753,7 +794,7 @@ export default function App() {
                 style={{width:"100%",background:T.input,border:`1px solid ${T.border2}`,color:T.text,borderRadius:10,padding:"10px 14px",fontSize:14,fontFamily:"'Space Grotesk',monospace"}}
               />
               <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                {[{k:"deposits",l:"+ Liq Added"},{k:"sp",l:"⭐ SP Score"},{k:"swaps",l:"⇄ Swaps"},{k:"lastSeen",l:"🕒 Recent"}].map(o=>(
+                {[{k:"swaps",l:"⇄ Swaps"},{k:"swapVolumeUSD",l:"💰 Volume"},{k:"sp",l:"⭐ SP Score"},{k:"lastSeen",l:"🕒 Recent"}].map(o=>(
                   <button key={o.k} onClick={()=>setSortBy(o.k)} style={{background:sortBy===o.k?"#00d4aa22":"transparent",border:`1.5px solid ${sortBy===o.k?"#00d4aa":T.border2}`,color:sortBy===o.k?"#00d4aa":T.sub,borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}>{o.l}</button>
                 ))}
               </div>
