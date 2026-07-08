@@ -282,13 +282,20 @@ async function buildLeaderboard() {
     if (batch.length < 10000) break;
   }
 
+  // 3. Get swap volume by fetching tokentx for each wallet found
+  // Strategy: tokentx from router shows all transfers. We need transfers WHERE
+  // the initiating wallet sent tokens TO the router (first leg of the swap)
+  // Filter: from=wallet, to=router, hash matches a known swap hash
   const countedSwap = new Set();
   routerTokenTxs.forEach(t => {
     const from = t.from?.toLowerCase();
     const to   = t.to?.toLowerCase();
     const h    = t.hash?.toLowerCase();
+    // User sends stablecoin TO router to initiate swap
     if (to !== ROUTER_ADDR) return;
-    if (!wallets[from] || !swapHashes[from]?.has(h)) return;
+    if (!wallets[from]) return;
+    // Accept any tx hash where this wallet sent to router
+    // (even if not in swapHashes — router tokentx may miss some)
     const key = `${from}:${h}`;
     if (countedSwap.has(key)) return;
     countedSwap.add(key);
@@ -319,7 +326,7 @@ async function buildLeaderboard() {
     const to   = t.to?.toLowerCase();
     const h    = t.hash?.toLowerCase();
     if (!POOL_ADDRS.has(to)) return;
-    if (!wallets[from] || !liqHashes[from]?.has(h)) return;
+    if (!wallets[from]) return;
     const key = `${from}:${h}`;
     if (countedLiq.has(key)) return;
     countedLiq.add(key);
@@ -347,8 +354,8 @@ async function buildLeaderboard() {
         : 1,
     }))
     // Rank by: swaps desc → swapVolumeUSD desc → sp desc
-    .sort((a,b) => b.swaps - a.swaps || b.swapVolumeUSD - a.swapVolumeUSD || b.sp - a.sp)
-    .slice(0, 10000);
+    .sort((a,b) => b.totalVolumeUSD - a.totalVolumeUSD || b.sp - a.sp)
+    .slice(0, 50);
 }
 
 // ── UI COMPONENTS ──────────────────────────────────────────
@@ -576,7 +583,7 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
           </div>
 
           <div style={{display:"grid",gridTemplateColumns:isMobile?"1fr 1fr":"repeat(4,1fr)",gap:12,marginBottom:16}}>
-            <StatBox label="⭐ SP Score"    value={totalSP.toLocaleString()} color="#f59e0b" sub="1 SP per $1,000 vol" theme={T}/>
+            <StatBox label="⭐ SP Score"    value={totalSP.toLocaleString()} color="#f59e0b" sub="$1,000 swap = 10 SP" theme={T}/>
             <StatBox label="💰 Swap Volume" value={fmtUSD(totalVol)}         color="#00d4aa" theme={T}/>
             <StatBox label="⇄ Swaps"       value={swapCount}                 color="#e2e8f0" theme={T}/>
             <StatBox
@@ -599,7 +606,7 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
                 <span style={{margin:"0 8px"}}>·</span>
                 <span style={{color:"#e2e8f0"}}>{periodStats.swaps} swaps</span>
                 <span style={{margin:"0 8px"}}>·</span>
-                <span style={{color:"#f59e0b"}}>+{calcSP(periodStats.vol, 0)} SP earned</span>
+                <span style={{color:"#f59e0b"}}>+{calcSP(periodStats.vol, 0).toLocaleString()} SP earned</span>
               </div>
             </div>
             <div style={{display:"flex",gap:6}}>
@@ -707,7 +714,7 @@ export default function App() {
     return d;
   },[board,tierF,search,sortBy]);
 
-  const displayed=showAll?sorted:sorted.slice(0,25);
+  const displayed=sorted;
   const totalSP  =board.reduce((s,w)=>s+w.sp,0);
   const totalVol =board.reduce((s,w)=>s+(w.totalVolumeUSD||w.swapVolumeUSD),0);
   const sec={background:T.card,border:`1px solid ${T.border}`,borderRadius:14,padding:16};
@@ -762,7 +769,7 @@ export default function App() {
 
           <div style={{background:"#f59e0b0d",border:"1px solid #f59e0b22",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:T.sub,display:"flex",alignItems:"center",gap:8}}>
             <span style={{fontSize:16}}>⭐</span>
-            <span>Ranked by Swaps · Swap $1,000 = 10 SP · LP Deposit $1,000 = 20 SP · Live from Sepolia</span>
+            <span>Top 50 · Ranked by Total Volume (Swaps + Liquidity) · Swap $1,000 = 10 SP · LP $1,000 = 20 SP</span>
           </div>
 
           {loading?<Spinner text="Fetching leaderboard from Sepolia..."/>:(<>
