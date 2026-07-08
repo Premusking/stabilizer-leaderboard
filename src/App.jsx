@@ -207,153 +207,93 @@ async function getWalletData(walletAddr) {
   return results.sort((a,b) => parseInt(b.timeStamp) - parseInt(a.timeStamp));
 }
 
-// Leaderboard — pulls ALL router txs (paginated) for accurate 15K+ wallet data
-// Ranked by: swap count → swap volume → SP
+// Leaderboard — top 50 by volume
+// Step 1: get all unique wallets from router txs (swap count)
+// Step 2: for top wallets by swap count, fetch their own tokentx to get real volume
 async function buildLeaderboard() {
-  const wallets = {};
-  const swapHashes = {}; // wallet -> Set of swap tx hashes
-  const liqHashes  = {}; // wallet -> Set of liq tx hashes
+  // 1. Fetch router txs to get swap counts per wallet
+  const swapCount = {};
+  const lastSeenMap = {};
+  const firstSeenMap = {};
+  const addressMap = {};
 
-  const init = (addr, from) => {
-    if (!wallets[addr]) {
-      wallets[addr]   = { address: from, swaps:0, deposits:0, withdrawals:0, claims:0, swapVolumeUSD:0, liqVolumeUSD:0, lastSeen:0, firstSeen:Infinity };
-      swapHashes[addr] = new Set();
-      liqHashes[addr]  = new Set();
-    }
-  };
-  const stamp = (w, ts) => {
-    if (ts > w.lastSeen)  w.lastSeen  = ts;
-    if (ts < w.firstSeen) w.firstSeen = ts;
-  };
-
-  // 1. Fetch ALL router txs (paginated) — router has all swap interactions
-  const routerTxs = [];
   for (let page = 1; page <= 5; page++) {
     const batch = await apiGet(ROUTER_ADDR, "txlist", 10000, page);
     if (!batch.length) break;
-    routerTxs.push(...batch);
+    batch.forEach(tx => {
+      if (tx.isError === "1") return;
+      const addr = tx.from?.toLowerCase(); if (!addr) return;
+      addressMap[addr] = tx.from;
+      swapCount[addr]  = (swapCount[addr] || 0) + 1;
+      const ts = parseInt(tx.timeStamp);
+      if (!lastSeenMap[addr]  || ts > lastSeenMap[addr])  lastSeenMap[addr]  = ts;
+      if (!firstSeenMap[addr] || ts < firstSeenMap[addr]) firstSeenMap[addr] = ts;
+    });
     if (batch.length < 10000) break;
   }
 
-  // 2. Fetch pool txs (deposits/withdrawals/claims) — paginate top 3 pages
-  const poolTxsArr = await Promise.all(
-    Object.values(POOLS).map(async p => {
-      const all = [];
-      for (let page = 1; page <= 3; page++) {
-        const batch = await apiGet(p.address, "txlist", 10000, page);
-        if (!batch.length) break;
-        all.push(...batch);
-        if (batch.length < 10000) break;
-      }
-      return all;
-    })
-  );
-  const allPoolTxs = poolTxsArr.flat();
+  // 2. Sort by swap count, take top 100 candidates for volume lookup
+  const topWallets = Object.keys(swapCount)
+    .sort((a,b) => swapCount[b] - swapCount[a])
+    .slice(0, 100);
 
-  // Process router txs — each is a swap
-  routerTxs.forEach(tx => {
-    if (tx.isError === "1") return;
-    const addr = tx.from?.toLowerCase(); if (!addr) return;
-    init(addr, tx.from);
-    wallets[addr].swaps++;
-    swapHashes[addr].add(tx.hash?.toLowerCase());
-    stamp(wallets[addr], parseInt(tx.timeStamp));
-  });
+  // 3. Fetch each wallet's own token transfers to get real USD volume
+  // Stablecoins sent TO router = swap volume
+  // Stablecoins sent TO pool   = liquidity volume
+  const results = await Promise.all(topWallets.map(async addr => {
+    let swapVol = 0, liqVol = 0, deposits = 0, withdrawals = 0, claims = 0;
+    const seenHashes = new Set();
 
-  // Process pool txs
-  allPoolTxs.forEach(tx => {
-    if (tx.isError === "1") return;
-    const addr = tx.from?.toLowerCase(); if (!addr) return;
-    const type = getTxType(tx);
-    if (!type || type === "swap") return;
-    init(addr, tx.from);
-    if (type === "deposit")  { wallets[addr].deposits++;  liqHashes[addr].add(tx.hash?.toLowerCase()); }
-    if (type === "withdraw") { wallets[addr].withdrawals++; }
-    if (type === "claim")    { wallets[addr].claims++; }
-    stamp(wallets[addr], parseInt(tx.timeStamp));
-  });
+    try {
+      const tokenTxs = await apiGet(addr, "tokentx", 5000, 1);
+      tokenTxs.forEach(t => {
+        const to  = t.to?.toLowerCase();
+        const h   = t.hash?.toLowerCase();
+        if (seenHashes.has(h)) return;
 
-  // 3. Router token transfers for swap volume — one transfer per tx per wallet
-  const routerTokenTxs = [];
-  for (let page = 1; page <= 3; page++) {
-    const batch = await apiGet(ROUTER_ADDR, "tokentx", 10000, page);
-    if (!batch.length) break;
-    routerTokenTxs.push(...batch);
-    if (batch.length < 10000) break;
-  }
+        const dec = parseInt(t.tokenDecimal) || 6;
+        const amt = parseFloat(t.value) / Math.pow(10, dec);
+        if (isNaN(amt) || !isFinite(amt) || amt <= 0 || amt > 1_000_000_000) return;
 
-  // 3. Get swap volume by fetching tokentx for each wallet found
-  // Strategy: tokentx from router shows all transfers. We need transfers WHERE
-  // the initiating wallet sent tokens TO the router (first leg of the swap)
-  // Filter: from=wallet, to=router, hash matches a known swap hash
-  const countedSwap = new Set();
-  routerTokenTxs.forEach(t => {
-    const from = t.from?.toLowerCase();
-    const to   = t.to?.toLowerCase();
-    const h    = t.hash?.toLowerCase();
-    // User sends stablecoin TO router to initiate swap
-    if (to !== ROUTER_ADDR) return;
-    if (!wallets[from]) return;
-    // Accept any tx hash where this wallet sent to router
-    // (even if not in swapHashes — router tokentx may miss some)
-    const key = `${from}:${h}`;
-    if (countedSwap.has(key)) return;
-    countedSwap.add(key);
-    const dec = parseInt(t.tokenDecimal) || 6;
-    const amt = parseFloat(t.value) / Math.pow(10, dec);
-    if (!isNaN(amt) && isFinite(amt) && amt > 0 && amt < 1_000_000_000)
-      wallets[from].swapVolumeUSD += amt;
-  });
+        if (to === ROUTER_ADDR) {
+          seenHashes.add(h); // count once per swap tx
+          swapVol += amt;
+        } else if (POOL_ADDRS.has(to)) {
+          liqVol += amt;
+        }
+      });
 
-  // 4. Pool token transfers for liquidity volume
-  const poolTokenTxsArr = await Promise.all(
-    Object.values(POOLS).map(async p => {
-      const all = [];
-      for (let page = 1; page <= 3; page++) {
-        const batch = await apiGet(p.address, "tokentx", 5000, page);
-        if (!batch.length) break;
-        all.push(...batch);
-        if (batch.length < 5000) break;
-      }
-      return all;
-    })
-  );
-  const allPoolTokenTxs = poolTokenTxsArr.flat();
+      // Also get pool txs for deposit/withdraw/claim counts
+      const poolTxBatches = await Promise.all(
+        Object.values(POOLS).map(p => apiGet(p.address, "txlist", 500, 1))
+      );
+      poolTxBatches.flat().forEach(tx => {
+        if (tx.from?.toLowerCase() !== addr || tx.isError === "1") return;
+        const type = getTxType(tx);
+        if (type === "deposit")  deposits++;
+        if (type === "withdraw") withdrawals++;
+        if (type === "claim")    claims++;
+      });
+    } catch {}
 
-  const countedLiq = new Set();
-  allPoolTokenTxs.forEach(t => {
-    const from = t.from?.toLowerCase();
-    const to   = t.to?.toLowerCase();
-    const h    = t.hash?.toLowerCase();
-    if (!POOL_ADDRS.has(to)) return;
-    if (!wallets[from]) return;
-    const key = `${from}:${h}`;
-    if (countedLiq.has(key)) return;
-    countedLiq.add(key);
-    const dec = parseInt(t.tokenDecimal) || 6;
-    const amt = parseFloat(t.value) / Math.pow(10, dec);
-    if (!isNaN(amt) && isFinite(amt) && amt > 0 && amt < 1_000_000_000)
-      wallets[from].liqVolumeUSD += amt;
-  });
-
-  return Object.values(wallets)
-    .map(w => ({
-      address:        w.address,
-      swaps:          w.swaps,
-      deposits:       w.deposits,
-      withdrawals:    w.withdrawals,
-      claims:         w.claims,
-      swapVolumeUSD:  Math.round(w.swapVolumeUSD),
-      liqVolumeUSD:   Math.round(w.liqVolumeUSD),
-      totalVolumeUSD: Math.round(w.swapVolumeUSD + w.liqVolumeUSD),
-      sp:             calcSP(w.swapVolumeUSD, w.liqVolumeUSD),
-      lastSeen:       w.lastSeen,
-      firstSeen:      w.firstSeen,
-      daysActive:     w.firstSeen < Infinity
-        ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - w.firstSeen) / 86400))
+    const totalVol = swapVol + liqVol;
+    return {
+      address:        addressMap[addr],
+      swaps:          swapCount[addr] || 0,
+      deposits, withdrawals, claims,
+      swapVolumeUSD:  Math.round(swapVol),
+      liqVolumeUSD:   Math.round(liqVol),
+      totalVolumeUSD: Math.round(totalVol),
+      sp:             calcSP(swapVol, liqVol),
+      lastSeen:       lastSeenMap[addr]  || 0,
+      firstSeen:      firstSeenMap[addr] || 0,
+      daysActive:     firstSeenMap[addr]
+        ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - firstSeenMap[addr]) / 86400))
         : 1,
-    }))
-    // Rank by: swaps desc → swapVolumeUSD desc → sp desc
+    };
+  }));
+
+  return results
     .sort((a,b) => b.totalVolumeUSD - a.totalVolumeUSD || b.sp - a.sp)
     .slice(0, 50);
 }
@@ -517,10 +457,20 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
 
   // Find leaderboard rank for this wallet
   const lbRank = useMemo(()=>{
-    if (!board?.length || !wallet) return null;
-    const idx = board.findIndex(w => w.address.toLowerCase() === wallet.toLowerCase());
-    return idx >= 0 ? idx + 1 : null;
-  },[board, wallet]);
+    if (!wallet) return null;
+    // First check if wallet is in the loaded top-50 board
+    if (board?.length) {
+      const idx = board.findIndex(w => w.address.toLowerCase() === wallet.toLowerCase());
+      if (idx >= 0) return idx + 1;
+    }
+    // Wallet not in top 50 — rank based on SP vs board
+    // Show approximate rank based on SP score vs top 50
+    if (board?.length && totalSP > 0) {
+      const betterCount = board.filter(w => w.sp > totalSP).length;
+      return betterCount + 1;
+    }
+    return null;
+  },[board, wallet, totalSP]);
 
   const periodStats = useMemo(()=>{
     const s={swaps:0,vol:0,claims:0};
@@ -590,7 +540,9 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
               label="🏆 Leaderboard Rank"
               value={lbRank ? `#${lbRank}` : "—"}
               color="#f59e0b"
-              sub={lbRank ? `Top ${((lbRank/Math.max(board?.length,1))*100).toFixed(1)}% of wallets` : "Not ranked yet"}
+              sub={lbRank && board?.findIndex(w=>w.address.toLowerCase()===wallet.toLowerCase())>=0
+                ? `Top ${((lbRank/50)*100).toFixed(0)}% of top wallets`
+                : lbRank ? `Est. rank by SP score` : "Search to see rank"}
               theme={T}
             />
           </div>
