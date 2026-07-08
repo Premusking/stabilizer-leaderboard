@@ -228,7 +228,7 @@ async function buildLeaderboard() {
 
   // 1. Fetch ALL router txs (paginated) — router has all swap interactions
   const routerTxs = [];
-  for (let page = 1; page <= 15; page++) {
+  for (let page = 1; page <= 5; page++) {
     const batch = await apiGet(ROUTER_ADDR, "txlist", 10000, page);
     if (!batch.length) break;
     routerTxs.push(...batch);
@@ -275,7 +275,7 @@ async function buildLeaderboard() {
 
   // 3. Router token transfers for swap volume — one transfer per tx per wallet
   const routerTokenTxs = [];
-  for (let page = 1; page <= 5; page++) {
+  for (let page = 1; page <= 3; page++) {
     const batch = await apiGet(ROUTER_ADDR, "tokentx", 10000, page);
     if (!batch.length) break;
     routerTokenTxs.push(...batch);
@@ -500,7 +500,7 @@ function ActivityTracker({ isMobile, jumpWallet, board, T }) {
   const displayed = useMemo(()=>filter==="all"?events:events.filter(e=>e.txType===filter),[events,filter]);
 
   const totalVol     = events.filter(e=>e.txType==="swap").reduce((s,e)=>s+e.volumeUSD,0);
-  const totalSP      = calcSP(totalSwapVol, 0);
+  const totalSP      = calcSP(totalVol, 0);
   const swapCount    = events.filter(e=>e.txType==="swap").length;
   const claimCount   = events.filter(e=>e.txType==="claim").length;
   const lastSeen     = events.length?events[0].timeStamp:null;
