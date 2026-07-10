@@ -207,15 +207,15 @@ async function getWalletData(walletAddr) {
   return results.sort((a,b) => parseInt(b.timeStamp) - parseInt(a.timeStamp));
 }
 
-// Leaderboard — top 50 by volume
-// Step 1: get all unique wallets from router txs (swap count)
-// Step 2: for top wallets by swap count, fetch their own tokentx to get real volume
+// Leaderboard — accurate volume from router token transfers
+// Fetches router txlist (swap counts) + router tokentx (volumes) in parallel
+// Groups token transfers by wallet for accurate per-wallet volume
 async function buildLeaderboard() {
-  // 1. Fetch router txs to get swap counts per wallet
-  const swapCount = {};
-  const lastSeenMap = {};
-  const firstSeenMap = {};
-  const addressMap = {};
+  // Step 1: Get ALL router txs for swap counts (paginated)
+  const swapCountMap   = {};
+  const lastSeenMap    = {};
+  const firstSeenMap   = {};
+  const addressMap     = {};
 
   for (let page = 1; page <= 5; page++) {
     const batch = await apiGet(ROUTER_ADDR, "txlist", 10000, page);
@@ -223,8 +223,8 @@ async function buildLeaderboard() {
     batch.forEach(tx => {
       if (tx.isError === "1") return;
       const addr = tx.from?.toLowerCase(); if (!addr) return;
-      addressMap[addr] = tx.from;
-      swapCount[addr]  = (swapCount[addr] || 0) + 1;
+      addressMap[addr]    = tx.from;
+      swapCountMap[addr]  = (swapCountMap[addr] || 0) + 1;
       const ts = parseInt(tx.timeStamp);
       if (!lastSeenMap[addr]  || ts > lastSeenMap[addr])  lastSeenMap[addr]  = ts;
       if (!firstSeenMap[addr] || ts < firstSeenMap[addr]) firstSeenMap[addr] = ts;
@@ -232,68 +232,103 @@ async function buildLeaderboard() {
     if (batch.length < 10000) break;
   }
 
-  // 2. Sort by swap count, take top 100 candidates for volume lookup
-  const topWallets = Object.keys(swapCount)
-    .sort((a,b) => swapCount[b] - swapCount[a])
-    .slice(0, 100);
+  // Step 2: Get router token transfers — group by FROM wallet to compute swap volume
+  // Each swap: user sends stablecoin FROM their wallet TO router
+  const swapVolMap  = {}; // wallet -> total swap volume USD
+  const seenSwapTx  = new Set(); // wallet:hash dedup
 
-  // 3. Fetch each wallet's own token transfers to get real USD volume
-  // Stablecoins sent TO router = swap volume
-  // Stablecoins sent TO pool   = liquidity volume
-  const results = await Promise.all(topWallets.map(async addr => {
-    let swapVol = 0, liqVol = 0, deposits = 0, withdrawals = 0, claims = 0;
-    const seenHashes = new Set();
+  for (let page = 1; page <= 5; page++) {
+    const batch = await apiGet(ROUTER_ADDR, "tokentx", 10000, page);
+    if (!batch.length) break;
+    batch.forEach(t => {
+      const from = t.from?.toLowerCase();
+      const to   = t.to?.toLowerCase();
+      const h    = t.hash?.toLowerCase();
+      // Only count: user wallet → router (the initiating stablecoin transfer)
+      if (to !== ROUTER_ADDR) return;
+      if (!swapCountMap[from]) return; // only known swappers
+      const key = `${from}:${h}`;
+      if (seenSwapTx.has(key)) return;
+      seenSwapTx.add(key);
+      const dec = parseInt(t.tokenDecimal) || 6;
+      const amt = parseFloat(t.value) / Math.pow(10, dec);
+      if (!isNaN(amt) && isFinite(amt) && amt > 0 && amt < 500_000_000) {
+        swapVolMap[from] = (swapVolMap[from] || 0) + amt;
+      }
+    });
+    if (batch.length < 10000) break;
+  }
 
-    try {
-      const tokenTxs = await apiGet(addr, "tokentx", 5000, 1);
-      tokenTxs.forEach(t => {
-        const to  = t.to?.toLowerCase();
-        const h   = t.hash?.toLowerCase();
-        if (seenHashes.has(h)) return;
+  // Step 3: Get pool token transfers for liquidity volume
+  const liqVolMap = {};
+  const seenLiqTx = new Set();
 
+  for (const [, poolInfo] of Object.entries(POOLS)) {
+    for (let page = 1; page <= 2; page++) {
+      const batch = await apiGet(poolInfo.address, "tokentx", 10000, page);
+      if (!batch.length) break;
+      batch.forEach(t => {
+        const from = t.from?.toLowerCase();
+        const to   = t.to?.toLowerCase();
+        const h    = t.hash?.toLowerCase();
+        if (!POOL_ADDRS.has(to)) return;
+        if (!addressMap[from]) return;
+        const key = `${from}:${h}`;
+        if (seenLiqTx.has(key)) return;
+        seenLiqTx.add(key);
         const dec = parseInt(t.tokenDecimal) || 6;
         const amt = parseFloat(t.value) / Math.pow(10, dec);
-        if (isNaN(amt) || !isFinite(amt) || amt <= 0 || amt > 1_000_000_000) return;
-
-        if (to === ROUTER_ADDR) {
-          seenHashes.add(h); // count once per swap tx
-          swapVol += amt;
-        } else if (POOL_ADDRS.has(to)) {
-          liqVol += amt;
+        if (!isNaN(amt) && isFinite(amt) && amt > 0 && amt < 500_000_000) {
+          liqVolMap[from] = (liqVolMap[from] || 0) + amt;
         }
       });
+      if (batch.length < 10000) break;
+    }
+  }
 
-      // Also get pool txs for deposit/withdraw/claim counts
-      const poolTxBatches = await Promise.all(
-        Object.values(POOLS).map(p => apiGet(p.address, "txlist", 500, 1))
-      );
-      poolTxBatches.flat().forEach(tx => {
-        if (tx.from?.toLowerCase() !== addr || tx.isError === "1") return;
-        const type = getTxType(tx);
-        if (type === "deposit")  deposits++;
-        if (type === "withdraw") withdrawals++;
-        if (type === "claim")    claims++;
-      });
-    } catch {}
+  // Step 4: Get pool txs for deposit/withdraw/claim counts
+  const depositMap    = {};
+  const withdrawMap   = {};
+  const claimMap      = {};
 
-    const totalVol = swapVol + liqVol;
-    return {
-      address:        addressMap[addr],
-      swaps:          swapCount[addr] || 0,
-      deposits, withdrawals, claims,
-      swapVolumeUSD:  Math.round(swapVol),
-      liqVolumeUSD:   Math.round(liqVol),
-      totalVolumeUSD: Math.round(totalVol),
-      sp:             calcSP(swapVol, liqVol),
-      lastSeen:       lastSeenMap[addr]  || 0,
-      firstSeen:      firstSeenMap[addr] || 0,
-      daysActive:     firstSeenMap[addr]
-        ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - firstSeenMap[addr]) / 86400))
-        : 1,
-    };
-  }));
+  for (const [, poolInfo] of Object.entries(POOLS)) {
+    const batch = await apiGet(poolInfo.address, "txlist", 2000, 1);
+    batch.forEach(tx => {
+      if (tx.isError === "1") return;
+      const addr = tx.from?.toLowerCase(); if (!addr) return;
+      const type = getTxType(tx);
+      if (type === "deposit")  depositMap[addr]  = (depositMap[addr]  || 0) + 1;
+      if (type === "withdraw") withdrawMap[addr] = (withdrawMap[addr] || 0) + 1;
+      if (type === "claim")    claimMap[addr]    = (claimMap[addr]    || 0) + 1;
+      if (!lastSeenMap[addr] || parseInt(tx.timeStamp) > lastSeenMap[addr])
+        lastSeenMap[addr] = parseInt(tx.timeStamp);
+    });
+  }
 
-  return results
+  // Step 5: Build final leaderboard
+  return Object.keys(swapCountMap)
+    .map(addr => {
+      const swapVol  = swapVolMap[addr]  || 0;
+      const liqVol   = liqVolMap[addr]   || 0;
+      const totalVol = swapVol + liqVol;
+      const sp       = calcSP(swapVol, liqVol);
+      return {
+        address:        addressMap[addr],
+        swaps:          swapCountMap[addr] || 0,
+        deposits:       depositMap[addr]   || 0,
+        withdrawals:    withdrawMap[addr]  || 0,
+        claims:         claimMap[addr]     || 0,
+        swapVolumeUSD:  Math.round(swapVol),
+        liqVolumeUSD:   Math.round(liqVol),
+        totalVolumeUSD: Math.round(totalVol),
+        sp,
+        lastSeen:       lastSeenMap[addr]  || 0,
+        firstSeen:      firstSeenMap[addr] || 0,
+        daysActive:     firstSeenMap[addr]
+          ? Math.max(1, Math.ceil((Math.floor(Date.now()/1000) - firstSeenMap[addr]) / 86400))
+          : 1,
+      };
+    })
     .sort((a,b) => b.totalVolumeUSD - a.totalVolumeUSD || b.sp - a.sp)
     .slice(0, 50);
 }
